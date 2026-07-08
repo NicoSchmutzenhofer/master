@@ -24,7 +24,7 @@ cd "$SLURM_SUBMIT_DIR"
 #
 # --- Reconstruction (produces the per-threshold volumes the decomposition reads) ---
 # Uncomment to (re)build the volumes first; this is the step that needs the GPU
-# (--gres above). Skip it if output/reconstruction_thr_{A,B,C,D}_HU.nii.gz already exist.
+# (--gres above). Skip it if output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz already exist.
 # python reconstruction/python_reconstruction.py
 #
 # --- Material decomposition, Phase A (CPU only; runs in order, stops on first error) ---

@@ -452,22 +452,26 @@ def decompose(volumes: np.ndarray, config: DecompConfig,
                 stability["condition_number"], stability["verdict"])
 
     # HU -> linear attenuation (per cumulative threshold) --------------------
+    # Filled one threshold at a time into a preallocated float32 buffer. This holds at most a
+    # single float64 temporary (not a list of four + a float64 stack), so peak RAM stays bounded
+    # on full volumes. The caller's `volumes` array is never mutated (the research harness reuses
+    # it across estimators/domains), so we build a separate buffer rather than converting in place.
     if config.hu_input:
         if mu_water is None:
             mu_water = np.full(n_bins, 0.20)
             warnings.warn("mu_water not provided; using nominal 0.20 /cm. Absolute density "
                           "scale relies on water_calibration.")
         mu_water = np.asarray(mu_water, dtype=float)
-        vols_mu = np.stack([hu_to_linear_attenuation(volumes[i], mu_water[i])
-                            for i in range(n_bins)], axis=0).astype(np.float32)
+        # Water ROI must be read in the HU domain, before the conversion.
+        if config.water_calibration and water_mask is None:
+            water_mask = np.abs(volumes[0]) < config.water_hu_tol
+        vols_mu = np.empty_like(volumes)                      # float32
+        for i in range(n_bins):
+            vols_mu[i] = hu_to_linear_attenuation(volumes[i], mu_water[i])  # float64 calc -> f32
     else:
         vols_mu = volumes
         mu_water = None if mu_water is None else np.asarray(mu_water, dtype=float)
-
-    # Water ROI (needs the HU input), then free the input volumes to bound memory ----
-    if config.water_calibration and water_mask is None and config.hu_input:
-        water_mask = np.abs(volumes[0]) < config.water_hu_tol
-    volumes = None  # HU input no longer needed (vols_mu holds the attenuation)
+    volumes = None  # drop our reference to the HU input; vols_mu holds the attenuation
 
     gains = np.ones(n_bins)
     if config.water_calibration:
@@ -721,24 +725,26 @@ def load_threshold_volumes_dicom(config: DecompConfig):
     index = build_dicom_index(folder, cache_path=cache)
     uids = _resolve_series(index, config.dicom_series)
 
-    arrs, ref = [], None
-    for lbl, uid in zip(config.threshold_labels, uids):
+    vols, ref = None, None
+    for i, (lbl, uid) in enumerate(zip(config.threshold_labels, uids)):
         paths = _slab_files(index[uid]["files"], config.z_slab_mm)
         r = sitk.ImageSeriesReader()
         r.SetFileNames(paths)
         img = r.Execute()                                  # 3D, HU (rescale applied by GDCM)
         if ref is None:
             ref = img
-        arrs.append(sitk.GetArrayFromImage(img).astype(np.float32))
-        del img
+        a = sitk.GetArrayFromImage(img).astype(np.float32)
+        if img is not ref:
+            del img
+        if vols is None:                                   # preallocate (4,Z,Y,X); fill in place
+            vols = np.empty((len(uids),) + a.shape, dtype=np.float32)
+        elif a.shape != vols.shape[1:]:
+            raise ValueError(f"Threshold series have mismatched shapes "
+                             f"({a.shape} vs {vols.shape[1:]}) -- check dicom_series / z_slab_mm")
+        vols[i] = a
+        del a
         logger.info("threshold %s <- series #%s (%s) : %d slices",
-                    lbl, index[uid]["number"], uid[-10:], arrs[-1].shape[0])
-    shapes = {a.shape for a in arrs}
-    if len(shapes) != 1:
-        raise ValueError(f"Threshold series have mismatched shapes {shapes} "
-                         "-- check dicom_series selection / z_slab_mm")
-    vols = np.stack(arrs, axis=0)
-    del arrs
+                    lbl, index[uid]["number"], uid[-10:], vols.shape[1])
     return vols, ref, None
 
 
@@ -756,21 +762,32 @@ def load_threshold_volumes(config: DecompConfig):
     if missing:
         raise FileNotFoundError("Missing threshold volume(s):\n  " + "\n  ".join(missing))
 
-    imgs = [sitk.ReadImage(str(p)) for p in paths]
-    ref = imgs[0]
-    arrs = [sitk.GetArrayFromImage(im).astype(np.float32) for im in imgs]  # (Z,Y,X)
-    shapes = {a.shape for a in arrs}
-    if len(shapes) != 1:
-        raise ValueError(f"Threshold volumes have mismatched shapes: {shapes}")
-
+    # Read one volume at a time into a preallocated (4,Z,Y,X) float32 buffer (avoids the list +
+    # np.stack that briefly doubles peak RAM on full volumes). Slab-crop each before storing.
+    img0 = sitk.ReadImage(str(paths[0]))
+    ref = img0
     if config.z_slab_mm is not None:
         z0, z1 = _slab_slice(ref, config.z_slab_mm)
-        arrs = [a[z0:z1] for a in arrs]
-        ref = ref[:, :, z0:z1]
         logger.info("z_slab_mm %s -> slices [%d:%d]", config.z_slab_mm, z0, z1)
+    else:
+        z0, z1 = 0, ref.GetSize()[2]
+    vols = None
+    for i, p in enumerate(paths):
+        img = img0 if i == 0 else sitk.ReadImage(str(p))
+        a = sitk.GetArrayFromImage(img).astype(np.float32)[z0:z1]  # (Z,Y,X)
+        if img is not img0:
+            del img
+        if vols is None:
+            vols = np.empty((len(paths),) + a.shape, dtype=np.float32)
+        elif a.shape != vols.shape[1:]:
+            raise ValueError(f"Threshold volumes have mismatched shapes: {a.shape} vs {vols.shape[1:]}")
+        vols[i] = a
+        del a
 
+    if config.z_slab_mm is not None:
+        ref = ref[:, :, z0:z1]
     mu_water = read_recon_calibration(config)
-    return np.stack(arrs, axis=0), ref, mu_water
+    return vols, ref, mu_water
 
 
 def save_decomp_result(result: DecompResult, ref, out_dir) -> List[Path]:

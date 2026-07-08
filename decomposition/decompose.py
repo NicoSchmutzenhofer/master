@@ -9,8 +9,8 @@ Run from the repo root:
     python -m decomposition.decompose      # preferred (package form)
     python decomposition/decompose.py      # also works
 
-Inputs: the reconstructed threshold volumes in output/ (see CONFIG). Reconstruction code is
-not touched. Outputs: output/decomposition/decomp_<mode>_*.nii.gz + *.json.
+Inputs: the reconstructed threshold volumes in output/reconstruction/ (see CONFIG). Reconstruction
+code is not touched. Outputs: output/decomposition/decomp_<mode>_*.nii.gz + *.json.
 """
 from __future__ import annotations
 
@@ -32,9 +32,11 @@ THRESHOLD_OPTION = 1         # 1 == the actual scan thresholds (20/40/56/75 keV)
 BIN_DOMAIN = "exclusive"     # 'exclusive' (A-B,B-C,C-D,D) | 'cumulative' (A,B,C,D)
 
 # --- input source --------------------------------------------------------------
-# 'dicom' = the Siemens clinical reconstructions (one flat folder of series); 'nifti' = our recon.
-INPUT_FORMAT = "dicom"       # 'dicom' | 'nifti'
-DICOM_DIR = "/data/Data2/4_BIN_PCCT/"   # flat folder holding all series
+# 'nifti' = our own reconstruction (output/reconstruction/reconstruction_thr_*_HU.nii.gz) -- the
+#           current default. 'dicom' = the Siemens clinical reconstructions (one flat folder of
+#           series) -- kept fully wired for the later switch to the Siemens output.
+INPUT_FORMAT = "nifti"       # 'nifti' (our recon, default) | 'dicom' (Siemens series, later)
+DICOM_DIR = "/data/Data2/4_BIN_PCCT/"   # flat folder of all series (used when INPUT_FORMAT='dicom')
 # Ordered SeriesNumber (or SeriesInstanceUID) for the 4 thresholds A,B,C,D.
 #   !!! NOT YET AVAILABLE -- the --dump-series check (2026-07-08) showed the 6 series in
 #   /data/Data2/4_BIN_PCCT/ are a DOSE SWEEP of the single lowest-threshold conventional image
@@ -55,12 +57,13 @@ DENOISE_GUIDE = False        # cross-channel guiding (guide = highest-SNR channe
 JOINT_ITERS = 10             # iterations for wls_joint
 
 WATER_CALIBRATION = True     # per-bin unit scaling to NIST water (NOT a stability remedy)
-# Develop on a z-slab to keep RAM small (full 2224-slice volume x4 thresholds is heavy).
-# The Siemens z-axis is table position (ImagePositionPatient), NOT our recon coords -- the full
-# extent here is z -2267.9..-1377.9 mm. This dev slab matches series 29's targeted sub-region
-# (z -1489..-1378, ~279 slices), the likely phantom location. Set None for the full volume.
-Z_SLAB_MM = (-1489.1, -1377.9)
-INPUT_DIR = str(_REPO_ROOT / "output")
+# Full volume by default (None). The decomposition is memory-bounded (chunked solve + in-place
+# HU->attenuation), so the full ~2000-slice x4-threshold volume fits the 64 GB SLURM budget.
+# Set a (z_lo, z_hi) mm range to restrict to a slab -- useful for the DICOM/Siemens workflow
+# (its z-axis is table position ImagePositionPatient, full extent ~ -2267.9..-1377.9 mm) or for
+# quick dev runs / the iterative wls_joint estimator.
+Z_SLAB_MM = None
+INPUT_DIR = str(_REPO_ROOT / "output" / "reconstruction")
 OUTPUT_DIR = str(_REPO_ROOT / "output" / "decomposition")
 # ====================================================================
 

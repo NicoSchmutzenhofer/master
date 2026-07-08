@@ -167,7 +167,7 @@ WAVELET_RING_THRESHOLD = 2.0
 # ENABLE_HU_CALIBRATION=True: auto-detect mu_water and mu_air from the
 #   reconstructed volume (per threshold), convert output to Hounsfield Units,
 #   and write both raw-attenuation and HU-scaled NIfTIs.
-# Calibration parameters are cached in output/calibration_<label>.json.
+# Calibration parameters are cached in output/reconstruction/calibration_thr_<label>.json.
 ENABLE_HU_CALIBRATION = True
 
 # Z-smoothing (post-recon noise reduction)
@@ -273,10 +273,10 @@ if PATIENT_POSITION != 'HFS':
 
 data_path = Path(r"/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/full_sinogram_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.Körper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat")
 desc_path = Path(r"/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/descriptor_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.Körper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat")
-# Repo root = parent of this reconstruction/ folder; outputs go to repo-root/output
-# regardless of the working directory the job is launched from.
+# Repo root = parent of this reconstruction/ folder; reconstruction outputs go to
+# repo-root/output/reconstruction regardless of the working directory the job is launched from.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-out_dir   = _REPO_ROOT / "output"
+out_dir   = _REPO_ROOT / "output" / "reconstruction"
 out_dir.mkdir(parents=True, exist_ok=True)
 
 THR_LABELS = {0: 'A  (T1, all-E)', 1: 'B  (T2)',

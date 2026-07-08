@@ -64,7 +64,7 @@ def _warn(check: str, msg: str, data: dict | None = None) -> None:
 
 
 def flush_invariant_log(out_dir: Path | str) -> None:
-    """Write all accumulated soft-warn entries to output/invariant_log.json."""
+    """Write all accumulated soft-warn entries to <out_dir>/invariant_log.json."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "invariant_log.json"

@@ -45,8 +45,9 @@ python -m decomposition.research_decomposition       # κ tables + figures + fin
 python -m decomposition.decompose                    # one mode on the real volumes (needs SimpleITK + data)
 ```
 
-Inputs: `output/reconstruction_thr_{A,B,C,D}_HU.nii.gz` (cumulative thresholds A≥20…D≥75 keV;
-configurable in `DecompConfig` — **confirm the actual filenames on the cluster**).
+Inputs: `output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz` (our reconstruction, the
+default; cumulative thresholds A≥20…D≥75 keV; configurable in `DecompConfig` — **confirm the actual
+filenames on the cluster**). The DICOM/Siemens loader stays available via `INPUT_FORMAT='dicom'`.
 Outputs: `output/decomposition/`.
 
 ## Design notes
@@ -69,4 +70,4 @@ Outputs: `output/decomposition/`.
 Only bases containing a spectrally distinct (ideally K-edge) material are stable. With the scan
 thresholds (Option 1): iodine bases κ≈160 (usable); tissue-only bases κ≈6,000–12,500 (unstable),
 because low-Z tissue signatures are near-collinear (water vs soft-tissue cosine 0.99998). See
-[DECOMPOSITION_PLAN.md](DECOMPOSITION_PLAN.md) §3 and `output/decomposition/research/`.
+[DECOMPOSITION_PLAN.md](DECOMPOSITION_PLAN.md) §3 and `output/research/`.

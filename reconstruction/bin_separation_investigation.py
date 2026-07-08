@@ -28,11 +28,11 @@ phantom's "layers" 1–3 are a separate, geometric thing — unrelated to the bi
 
 INPUT
 ─────
-Loads output/reconstruction_thr_{A,B,C,D}_HU.nii.gz (your reconstructed volumes;
-no GPU needed).  Falls back to library reconstruction of a slab if absent.
+Loads output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz (your reconstructed
+volumes; no GPU needed).  Falls back to library reconstruction of a slab if absent.
 
-OUTPUT (output/)
-────────────────
+OUTPUT (output/research/bin_separation/)
+────────────────────────────────────────
 binsep_correlation.png, binsep_panels.png, bin_separation_metrics.json,
 bin_separation_findings.md.
 """
@@ -45,10 +45,11 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
-# Repo root = parent of this reconstruction/ folder; outputs/inputs resolve there
+# Repo root = parent of this reconstruction/ folder; inputs/outputs resolve there
 # regardless of the working directory.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = _REPO_ROOT / "output"
+IN_DIR = _REPO_ROOT / "output" / "reconstruction"                 # reads reconstructed volumes
+OUT_DIR = _REPO_ROOT / "output" / "research" / "bin_separation"   # writes figures/metrics/findings
 
 USE_HU = True
 VOL_PATTERN = "reconstruction_thr_{label}{hu}.nii.gz"
@@ -199,7 +200,7 @@ def load_bin_volumes():
     """Load [A,B,C,D] as (4,nz,ny,nx) over the slab.
     returns (stack, xy_mm, z_mm, z0_index, origin_z)."""
     hu = "_HU" if USE_HU else ""
-    paths = {lb: OUT_DIR / VOL_PATTERN.format(label=lb, hu=hu) for lb in LABELS}
+    paths = {lb: IN_DIR / VOL_PATTERN.format(label=lb, hu=hu) for lb in LABELS}
     if all(p.exists() for p in paths.values()):
         vols, spacing, origin = [], None, None
         for lb in LABELS:
@@ -214,14 +215,14 @@ def load_bin_volumes():
         else:
             z0, z1 = 0, nz
         stack = stack[:, z0:z1]
-        print(f"[load] {LABELS} from {OUT_DIR} (HU={USE_HU}); slab z=[{z0},{z1}) "
+        print(f"[load] {LABELS} from {IN_DIR} (HU={USE_HU}); slab z=[{z0},{z1}) "
               f"→ {stack.shape}; "
               f"{origin[2]+z0*spacing[2]:.1f}..{origin[2]+(z1-1)*spacing[2]:.1f} mm")
         return stack, float(spacing[0]), float(spacing[2]), z0, float(origin[2])
 
     if not RECON_FALLBACK:
         raise FileNotFoundError(
-            f"Threshold volumes not in {OUT_DIR} (pattern "
+            f"Threshold volumes not in {IN_DIR} (pattern "
             f"{VOL_PATTERN.format(label='?', hu=hu)}). Run the production pipeline "
             f"first, or set RECON_FALLBACK=True.")
 

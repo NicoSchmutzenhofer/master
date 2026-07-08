@@ -39,7 +39,7 @@ from decomposition.material_decomposition import (
 
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = _REPO_ROOT / "output" / "decomposition" / "research"
+DEFAULT_OUT = _REPO_ROOT / "output" / "research"
 
 # --- experiment registry (the extension surface) ---------------------------
 EXPERIMENTS: Dict[str, Callable] = {}
@@ -133,9 +133,10 @@ def threshold_option_scan(out_dir: Path, mode_keys: Optional[List[str]] = None) 
 
 
 @experiment("bin_domain_comparison")
-def bin_domain_comparison(out_dir: Path, base_config: DecompConfig) -> dict:
-    """Exclusive-via-subtraction vs cumulative-M on the same slab (needs volumes)."""
-    volumes, ref, mu_water = load_threshold_volumes(base_config)
+def bin_domain_comparison(out_dir: Path, base_config: DecompConfig, loaded=None) -> dict:
+    """Exclusive-via-subtraction vs cumulative-M on the same slab (needs volumes).
+    `loaded` = optional preloaded (volumes, ref, mu_water) to share one load across experiments."""
+    volumes, ref, mu_water = loaded if loaded is not None else load_threshold_volumes(base_config)
     water_mask = np.abs(volumes[0]) < base_config.water_hu_tol
     summary: dict = {}
     for domain in ("exclusive", "cumulative"):
@@ -166,16 +167,16 @@ def _map_metrics(m: np.ndarray) -> dict:
     return {"flat_noise_sd": ne.estimate_map_noise(m), "edge_sharpness": _edge_sharpness(m)}
 
 
-def _panel(path: Path, results: dict, materials, estimators) -> None:
+def _panel(path: Path, panels: dict, materials, estimators) -> None:
+    """panels[est][mat] = a precomputed 2-D mid-slice (so the caller need not keep full maps)."""
     plt = _mpl()
     if not plt:
         return
     ncol, nrow = len(materials), len(estimators)
     fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 3.0 * nrow), squeeze=False)
     for r, est in enumerate(estimators):
-        maps = results[est].material_maps
         for c, mat in enumerate(materials):
-            sl = maps[mat][maps[mat].shape[0] // 2]
+            sl = panels[est][mat]
             lo, hi = np.percentile(sl, [2, 98])
             ax = axes[r][c]
             ax.imshow(sl, vmin=lo, vmax=hi if hi > lo else lo + 1e-6, cmap="gray")
@@ -193,25 +194,30 @@ def _panel(path: Path, results: dict, materials, estimators) -> None:
 @experiment("estimator_ladder")
 def estimator_ladder(out_dir: Path, base_config: DecompConfig,
                      estimators=("ols", "wls", "wls_denoise"),
-                     noise_model: str = "global") -> dict:
+                     noise_model: str = "global", loaded=None) -> dict:
     """
     Run the estimator ladder on the loaded volume -> before/after panels + no-reference metrics
     (flat-region noise SD, edge sharpness) for radiologist-facing, ground-truth-free comparison.
     Needs the reconstructed volumes. 'wls_joint' is excluded by default (iterative + memory-heavy
     on a full volume); add it and set base_config.z_slab_mm to compare it on a slab.
+    `loaded` = optional preloaded (volumes, ref, mu_water) to share one load across experiments.
     """
-    volumes, ref, mu_water = load_threshold_volumes(base_config)
+    volumes, ref, mu_water = loaded if loaded is not None else load_threshold_volumes(base_config)
     water_mask = np.abs(volumes[0]) < base_config.water_hu_tol
     materials = list(modes.get_mode(base_config.mode).materials)
-    results, metrics = {}, {}
+    metrics, panels = {}, {}
     for est in estimators:
         cfg = DecompConfig.from_dict({**base_config.to_dict(),
                                       "estimator": est, "noise_model": noise_model})
         res = decompose(volumes, cfg, mu_water=mu_water, water_mask=water_mask)
-        results[est] = res
         metrics[est] = {mat: _map_metrics(res.material_maps[mat]) for mat in materials}
+        # Keep only the mid-slice per material for the visual panel, then drop the full maps
+        # so we never hold more than one estimator's volumes in memory at a time.
+        panels[est] = {mat: np.array(res.material_maps[mat][res.material_maps[mat].shape[0] // 2])
+                       for mat in materials}
+        del res
     (out_dir / "estimator_ladder_metrics.json").write_text(json.dumps(metrics, indent=2))
-    _panel(out_dir / "estimator_ladder.png", results, materials, estimators)
+    _panel(out_dir / "estimator_ladder.png", panels, materials, estimators)
     return {"metrics": metrics, "estimators": list(estimators), "materials": materials}
 
 
@@ -278,10 +284,11 @@ def main() -> None:
     # Set z_slab_mm for a fast targeted run of the (iterative) estimator ladder.
     # Light, memory-safe estimator for the full-volume comparisons (joint is slab-only).
     cfg = DecompConfig(mode="phantom_ca_i", estimator="wls", noise_model="global",
-                       input_dir=str(_REPO_ROOT / "output"), output_dir=str(out))
+                       input_dir=str(_REPO_ROOT / "output" / "reconstruction"), output_dir=str(out))
     try:
-        results["bin_domain_comparison"] = bin_domain_comparison(out, cfg)
-        results["estimator_ladder"] = estimator_ladder(out, cfg)
+        loaded = load_threshold_volumes(cfg)     # load once, shared across volume experiments
+        results["bin_domain_comparison"] = bin_domain_comparison(out, cfg, loaded=loaded)
+        results["estimator_ladder"] = estimator_ladder(out, cfg, loaded=loaded)
     except (FileNotFoundError, ImportError) as e:
         logger.warning("Skipping volume-based experiments (no volumes / SimpleITK): %s", e)
     findings = write_findings(out, results)

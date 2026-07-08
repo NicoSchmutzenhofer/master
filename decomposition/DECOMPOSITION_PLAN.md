@@ -12,7 +12,7 @@ stability answer to the professor's two questions ("are the transformations appl
 and "is the matrix stable?"). It is the decomposition-stage counterpart to
 [../docs/IMAGE_QUALITY_PLAN.md](../docs/IMAGE_QUALITY_PLAN.md).
 
-Inputs are the finished reconstruction outputs (`output/reconstruction_thr_{A,B,C,D}_HU.nii.gz`);
+Inputs are the finished reconstruction outputs (`output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz`);
 the reconstruction pipeline is **not** touched.
 
 ---
@@ -147,7 +147,7 @@ library. `decompose.py` runs one mode cleanly; `research_decomposition.py` loops
 
 **Data flow (per mode):**
 ```
-output/reconstruction_thr_{A,B,C,D}_HU.nii.gz
+output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz
    → HU → linear attenuation (1/cm), NIST water reference per bin
    → form B:  exclusive [A−B, B−C, C−D, D]   OR   cumulative [A, B, C, D]   (research-selectable)
    → build M (4×3) from selected mode's 3 materials, Option 1

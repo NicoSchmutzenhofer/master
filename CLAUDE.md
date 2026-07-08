@@ -13,17 +13,32 @@ A Git repository organised into folders: reconstruction code in `reconstruction/
 The working directory on this Windows machine is a mirror of the code that actually runs on a SLURM-managed Linux GPU cluster. Raw data lives at `/data/Data2/4_BIN_PCCT/...` (Linux paths hardcoded in scripts) and reconstruction needs a CUDA GPU for ASTRA's `FBP_CUDA`.
 
 ```bash
-# On the cluster — submit the job
-sbatch batch.sh        # runs reconstruction/python_reconstruction.py on node 'sauron', rtx6000ada GPU
+# On the cluster — submit a job (node 'sauron', rtx6000ada GPU)
+sbatch batch.sh            # reconstruction + decomposition pipeline (toggle the stanzas inside)
+sbatch batch_sinogram.sh   # the sinogram-separation investigation -> output/research/sinogram_separation/
 ```
 
 `batch.sh` activates the conda env `/home/nisc24/.conda/envs/MatDecomp` (Python + numpy, scipy, h5py, SimpleITK, astra-toolbox, pywavelets, scikit-image, matplotlib).
+
+### Decomposition module
+
+Run from the repo root, after the reconstruction has produced `output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz` (confirm actual filenames on the cluster):
+
+```bash
+python -m decomposition.selftest_decomposition      # math self-test (Phase A + B), no data needed
+python -m decomposition.research_decomposition       # κ tables + figures + findings, no volumes needed
+python -m decomposition.decompose                    # one mode on the real volumes (needs SimpleITK + data)
+```
+
+`decompose.py` defaults to **`INPUT_FORMAT='nifti'`** — our own reconstruction in `output/reconstruction/`. The DICOM loader (`INPUT_FORMAT='dicom'` + `DICOM_SERIES`) is kept fully wired for the later switch to the Siemens clinical output.
+
+`batch.sh`'s decomposition stanza runs these three in that order (CPU only, stops on first error). See [decomposition/README.md](decomposition/README.md) for the module layout and [decomposition/DECOMPOSITION_PLAN.md](decomposition/DECOMPOSITION_PLAN.md) for the stability analysis behind the estimator/material choices.
 
 ### Tuning loop
 
 [python_reconstruction.py](reconstruction/python_reconstruction.py) is the main entry point (the driver) and is mode-switched at the top of the file:
 
-- `FAST_MODE = True` — slab preview for all 4 thresholds (~seconds/threshold). Use this when tuning preprocessing, MAR, or geometry. Reconstructs an image-domain average over `PREVIEW_SLAB_MM` (so preview SNR ≈ the full volume), HU-calibrates each threshold, and shows all four on the same `PREVIEW_HU_WL` window so HU separation is judged fairly. Outputs: `output/preview_4thresholds_fast.png` and `output/defect_mask_diagnostic.png` (cross-threshold defect-mask comparison).
+- `FAST_MODE = True` — slab preview for all 4 thresholds (~seconds/threshold). Use this when tuning preprocessing, MAR, or geometry. Reconstructs an image-domain average over `PREVIEW_SLAB_MM` (so preview SNR ≈ the full volume), HU-calibrates each threshold, and shows all four on the same `PREVIEW_HU_WL` window so HU separation is judged fairly. Outputs: `output/reconstruction/preview_4thresholds_fast.png` and `output/reconstruction/defect_mask_diagnostic.png` (cross-threshold defect-mask comparison).
 - `FAST_MODE = False` — full helical volumes for all 4 thresholds (~hours). Writes one raw-attenuation NIfTI and one HU-calibrated `_HU.nii.gz` per threshold, plus a 4D `reconstruction_4thr_multienergy.nii.gz`.
 
 Config knobs at the top of the driver (all have inline comment blocks explaining failure modes):
@@ -34,7 +49,7 @@ Config knobs at the top of the driver (all have inline comment blocks explaining
 | `RECON_METHOD` | `'fbp'` | Reconstruction algorithm: `'fbp'` (default, established) / `'sirt'` / `'cgls'` (iterative, ASTRA). FBP behaviour is unchanged while `'fbp'`. |
 | `N_ITER` | `150` | Iterations for `'sirt'`/`'cgls'` (ignored for FBP). Full-volume iterative is ~2·N_ITER× slower per slice — use deliberately |
 | `PREVIEW_SLAB_MM` | `2.0` | FAST preview: image-domain average over this slab thickness so preview SNR ≈ full volume. `0` = single native slice |
-| `SPIKE_MAD_K` / `IPR_MAD_K` | `5.0` / `6.0` | Defect-detection MAD multipliers; **raise** to mask fewer channels (see `output/defect_mask_diagnostic.png`) |
+| `SPIKE_MAD_K` / `IPR_MAD_K` | `5.0` / `6.0` | Defect-detection MAD multipliers; **raise** to mask fewer channels (see `output/reconstruction/defect_mask_diagnostic.png`) |
 | `PREVIEW_HU_WL` | `(40, 400)` | HU window `(level, width)` for the FAST preview when HU calibration is on |
 | `FILTER_NAME` | `'shepp-logan'` | FBP filter. Use `'ram-lak'` for MTF/geometry tests only |
 | `GEOMETRY_MODEL` | `'curved'` | `'curved'` = correct equiangular→flat remap; `'flat'` = legacy |
@@ -55,17 +70,19 @@ Before touching reconstruction code, when the `.mat` file format is unfamiliar:
 
 ### File layout
 
-Folders (entry points `batch.sh` and `CLAUDE.md` stay at the root; `output/`, `logs/` are gitignored):
-- `reconstruction/` — all reconstruction code (library, driver, invariants, `.mat` diagnostics, bin-separation).
+Folders (entry points `batch.sh` and `CLAUDE.md` stay at the root; `output/`, `logs/` are gitignored). Run outputs are split by stage: **`output/reconstruction/`** (driver: NIfTIs, calibration JSONs, previews, `invariant_log.json`), **`output/research/<name>/`** (investigations + decomposition ablations), **`output/decomposition/`** (material maps):
+- `reconstruction/` — all reconstruction code (library, driver, invariants, `.mat` diagnostics, and the two threshold-separation investigations).
 - `geometry/` — detector-geometry inputs (`beta_*`/`zIso_*` text files + `Geo_P63.pdf`).
 - `docs/` — design/roadmap docs.
 - `decomposition/` — material-decomposition stage (Phases A+B: image-domain LS + stability audit; data-adaptive WLS / edge-preserving denoise / joint estimators, all selectable). A Python package (`python -m decomposition.decompose`) with its own `DECOMPOSITION_PLAN.md` / `README.md`.
 
 - **[helical_reconstruction.py](reconstruction/helical_reconstruction.py)** — pure library, no I/O of raw data, no `__main__`. All algorithm code: geometry build, defect detection, rebinning, preprocessing, MAR, reconstruction (`_astra_reconstruct` dispatches FBP/SIRT/CGLS; `_astra_fbp` is a thin wrapper), `reconstruct_slab` (image-domain slab averaging), HU calibration.
 - **[python_reconstruction.py](reconstruction/python_reconstruction.py)** — the driver: loads HDF5, loops over thresholds, calls library functions, writes outputs.
-- **[recon_invariants.py](reconstruction/recon_invariants.py)** — invariant/assertion module. **Do not modify check logic** — only append new checks. Called by the driver at every key pipeline stage; hard-fails on geometry errors, soft-warns everything else into `output/invariant_log.json`.
-- **[bin_separation_investigation.py](reconstruction/bin_separation_investigation.py)** — standalone, image-domain investigation of threshold separation for image quality (label-free; reads the reconstructed HU volumes). Concluded **negative** for image quality (cumulative bins share photons → correlated noise; see plan §4a); kept for the later material-decomposition work.
+- **[recon_invariants.py](reconstruction/recon_invariants.py)** — invariant/assertion module. **Do not modify check logic** — only append new checks. Called by the driver at every key pipeline stage; hard-fails on geometry errors, soft-warns everything else into `output/reconstruction/invariant_log.json`.
+- **[bin_separation_investigation.py](reconstruction/bin_separation_investigation.py)** — standalone, **image-domain** investigation of threshold separation for image quality (label-free; reads the reconstructed HU volumes from `output/reconstruction/`, writes to `output/research/bin_separation/`). Concluded **negative** for image quality (cumulative bins share photons → correlated noise; see plan §4a and [docs/BIN_SEPARATION_FINDINGS.md](docs/BIN_SEPARATION_FINDINGS.md)); kept for the later material-decomposition work.
+- **[sinogram_separation_investigation.py](reconstruction/sinogram_separation_investigation.py)** — standalone, **sinogram-domain** investigation (needs raw `.mat` + CUDA). Forms exclusive-window sinograms (A−B, B−C, C−D, D) *before* reconstruction and (1) measures whether the A≥B≥C≥D ordering violation is zero-mean noise or a systematic gain bias (the empirical test of invariant #3 — the discriminator is the projection-averaged exclusive value per detector element), and (2) compares subtract-then-SIRT vs SIRT-then-subtract (they differ only because SIRT is nonlinear). **Does not modify invariant #3 or the production pipeline.** Writes to `output/research/sinogram_separation/`.
 - **[IMAGE_QUALITY_PLAN.md](docs/IMAGE_QUALITY_PLAN.md)** — the design/roadmap doc behind the current revision. Explains *why* the noise/HU-separation knobs exist (WS1: `PREVIEW_SLAB_MM`, FAST-mode HU calibration, `SPIKE_MAD_K`/`IPR_MAD_K`; WS2: `RECON_METHOD`/`N_ITER` iterative recon) and records the project's non-breaking guarantees. **Deferred (out of scope, §4):** spectral-guided denoising (use high-SNR threshold A to guide the others), TV-regularized iterative, exclusive energy-bin images (A−B, B−C, C−D), and the material-decomposition stage itself. Read it before proposing image-quality changes so you don't re-litigate decided trade-offs or pull deferred work forward.
+- **[SOFTWARE_ROADMAP.md](docs/SOFTWARE_ROADMAP.md)** — future goal of a publishable GUI app over reconstruction + decomposition; not started, but its design principles are binding for **new decomposition code now**: three clean layers (pure library → entry-point API → CLI/GUI drivers), config as a serializable dataclass (not module-level constants), stable `progress`/`cancel`-callback-ready entry points, no hardcoded paths, and extensibility via registries (materials = a CSV row, clinical modes = a registry entry) so the tool stays adaptable without editing core algorithms. The reconstruction driver's top-of-file-constants style is explicitly **not** to be copied into decomposition, and is left as-is (its own retrofit is parked until decomposition is finished).
 
 ### Data pipeline (per threshold)
 
@@ -98,7 +115,7 @@ sino_full : float32 [N_proj, n_rows, n_channels]  ≈ 16 GB
 2. **Shepp-Logan filter default** — replaces Ram-Lak. Reduces noise ~30–60% without MTF impact at the center. Set `FILTER_NAME='ram-lak'` for geometry/MTF verification runs.
 3. **Adaptive wavelet stripe gating** — wavelet-FFT stripe removal (`remove_stripes_wavelet_fft`) now only runs when the sinogram's stripe-SNR proxy exceeds `WAVELET_RING_THRESHOLD`. Prevents it from washing out low-contrast inserts when no rings are present.
 4. **Helical projection weighting** (`z_weighting` in `rebin_helical_to_axial`, knob `Z_WEIGHTING`, default `'balanced'`) — controls how the rays of a rebinned rotation are weighted. The legacy **raised-cosine z-window** (`'hann'`, also `z_window=True`) tapers the projection axis to suppress 10–25 HU z-shading bands, but over a one-rotation window it doubles as an **angular apodization whose peak rides the helix** → a low-frequency brightness lobe that **rotates as you scroll z** (the "light cone"). `'balanced'` is **angularly-balanced helical weighting** (360°LI / complementary rebinning, Crawford & King 1990): it spans ~2 rotations, tapers each ray by `|z_offset|` (kills the z-shading) **and normalises every view angle to equal total weight** (kills the rotating bias). It is purely a sinogram-formation change — collapses to the same `(n_proj, n_ch)` contract and one ray per canonical view angle — so FBP/SIRT/CGLS all benefit identically and the recon code is untouched. `'none'` = uniform (no rotation, z-bands return). `check_angular_balance` (recon_invariants, soft) verifies the per-angle weight sum is 1. The wider window trims one rotation (not half) at each scan end — the driver passes `end_margin_rotations` to `z_targets_for_full_scan` accordingly.
-5. **Auto HU calibration** (`auto_hu_calibrate` / `apply_hu_calibration`) — Otsu body segmentation → 10 mm erosion → mode-based µ_water → median µ_air. Cached per-threshold to `output/calibration_thr_<label>.json`. Outputs both raw-attenuation and HU-scaled NIfTIs.
+5. **Auto HU calibration** (`auto_hu_calibrate` / `apply_hu_calibration`) — Otsu body segmentation → 10 mm erosion → mode-based µ_water → median µ_air. Cached per-threshold to `output/reconstruction/calibration_thr_<label>.json`. Outputs both raw-attenuation and HU-scaled NIfTIs.
 
 ### Critical, non-obvious invariants
 
