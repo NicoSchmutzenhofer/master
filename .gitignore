@@ -1,0 +1,6 @@
+logs/
+output/
+output_old/
+__pycache__/
+*.pyc
+geometry/
