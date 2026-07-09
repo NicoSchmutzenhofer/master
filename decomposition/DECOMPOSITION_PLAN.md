@@ -142,7 +142,7 @@ decomposition/
 ```
 
 Production and research **share the same library** (`material_decomposition.py`,
-`material_library.py`), exactly as `bin_separation_investigation.py` imports the reconstruction
+`material_library.py`), exactly as `image_subtraction_investigation.py` imports the reconstruction
 library. `decompose.py` runs one mode cleanly; `research_decomposition.py` loops over approaches.
 
 **Data flow (per mode):**
@@ -237,7 +237,7 @@ researcher adds a method as one function + one registry entry (built for reuse i
 - Cosine/correlation heatmap of the material signatures (the §3 "why").
 - Exclusive-vs-cumulative side-by-side material maps + noise maps.
 - **Insert-recovery scatter:** measured vs known density for the phantom Ca/I inserts (the money plot).
-- A `bin_separation`-style `decomposition_research_findings.md` write-up documenting which approach
+- A `image_subtraction`-style `decomposition_research_findings.md` write-up documenting which approach
   wins and *why* — the visual/quantitative justification of the design choices.
 
 ---

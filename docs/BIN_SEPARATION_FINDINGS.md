@@ -2,10 +2,10 @@
 
 Status: **investigation complete (June 2026), negative result.** These are durable,
 version-controlled notes for the thesis. The runtime-generated report lives at
-`output/research/bin_separation/bin_separation_findings.md` (gitignored); this document is the
+`output/research/image_subtraction/image_subtraction_findings.md` (gitignored); this document is the
 curated summary and the reasoning behind the decision.
 
-Tooling: [bin_separation_investigation.py](../reconstruction/bin_separation_investigation.py)
+Tooling: [image_subtraction_investigation.py](../reconstruction/image_subtraction_investigation.py)
 (standalone, image-domain, label-free; reads the four reconstructed HU volumes). Summary also
 recorded in [IMAGE_QUALITY_PLAN.md §4a](IMAGE_QUALITY_PLAN.md).
 
@@ -79,7 +79,7 @@ resolution proxy (~1 = resolution preserved, < 1 = blurred).
   bin A, although highest-count, is the **noisiest in HU** after calibration, so guiding with it
   pushes A's noise into the harder bins.
 
-(Exact per-bin figures are in `output/research/bin_separation/bin_separation_metrics.json` from the
+(Exact per-bin figures are in `output/research/image_subtraction/image_subtraction_metrics.json` from the
 run; the numbers above are the run-level summary.)
 
 ---
@@ -115,9 +115,9 @@ cross-bin denoiser to work in, which is exactly what the whitened-PCA variance f
   Pinning `WATER_ROI` to the Ø25 mm 0-HU calibration cylinder would give a textbook-clean
   confirmation, but does **not** change the structural conclusion (the rank-1 argument is
   independent of the ROI).
-- **Regenerate:** `python reconstruction/bin_separation_investigation.py` (reads
+- **Regenerate:** `python reconstruction/image_subtraction_investigation.py` (reads
   `output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz`; writes figures + metrics +
-  `bin_separation_findings.md` to `output/research/bin_separation/`). No GPU needed when the volumes
+  `image_subtraction_findings.md` to `output/research/image_subtraction/`). No GPU needed when the volumes
   already exist.
 
 ---
@@ -125,7 +125,7 @@ cross-bin denoiser to work in, which is exactly what the whitened-PCA variance f
 ## 7. Relation to the sinogram-domain study
 
 This study answers the **image-quality** question in the **image domain**. A separate investigation
-([sinogram_separation_investigation.py](../reconstruction/sinogram_separation_investigation.py))
+([sinogram_subtraction_investigation.py](../reconstruction/sinogram_subtraction_investigation.py))
 asks a **different** question: does forming the exclusive energy windows by **subtracting the
 sinograms** (before reconstruction) — treating the Siemens pile-up/scatter corrections as given —
 behave differently from subtracting the reconstructed images, and does it feed material

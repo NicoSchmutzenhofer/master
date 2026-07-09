@@ -107,7 +107,7 @@ Two problems observed in the current 4-threshold preview:
 
 ### 4a. Investigated June 2026 — bin separation for image quality: NEGATIVE result
 
-Tooling: [bin_separation_investigation.py](../reconstruction/bin_separation_investigation.py) (standalone, image-domain,
+Tooling: [image_subtraction_investigation.py](../reconstruction/image_subtraction_investigation.py) (standalone, image-domain,
 label-free; reads the 4 reconstructed HU volumes from `output/reconstruction/`; durable write-up in
 [BIN_SEPARATION_FINDINGS.md](BIN_SEPARATION_FINDINGS.md)). Goal was to use threshold separation to
 *improve image quality* (a pre-step before the later, separate material decomposition).

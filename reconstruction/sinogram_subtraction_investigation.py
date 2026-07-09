@@ -1,5 +1,5 @@
 """
-sinogram_separation_investigation.py
+sinogram_subtraction_investigation.py
 ─────────────────────────────────────
 INVESTIGATIVE, SINOGRAM-domain study of THRESHOLD SEPARATION.  Standalone; NOT
 part of the production reconstruction, and it does NOT modify CLAUDE.md invariant
@@ -14,7 +14,7 @@ GIVEN, and form the exclusive energy windows by SUBTRACTING the cumulative
 threshold sinograms
         E1 = A−B,  E2 = B−C,  E3 = C−D,  E4 = D
 BEFORE reconstruction, then reconstruct each.  This is the projection-domain
-counterpart of the image-domain study in bin_separation_investigation.py.
+counterpart of the image-domain study in image_subtraction_investigation.py.
 
 TWO QUESTIONS THIS ANSWERS
 ──────────────────────────
@@ -34,9 +34,9 @@ TWO QUESTIONS THIS ANSWERS
 
 INPUT : raw HDF5 .mat threshold sinograms (needs the cluster data + a CUDA GPU
         for ASTRA SIRT).  Same files as python_reconstruction.py.
-OUTPUT: output/research/sinogram_separation/
-          sinogram_separation_findings.md, sinogram_separation_metrics.json,
-          sinsep_negativity.png, sinsep_panels.png, sinsep_sino_vs_image.png
+OUTPUT: output/research/sinogram_subtraction/
+          sinogram_subtraction_findings.md, sinogram_subtraction_metrics.json,
+          sinogram_subtraction_negativity.png, sinogram_subtraction_panels.png, sinogram_subtraction_sino_vs_image.png
 
 MEMORY: holds at most TWO cumulative sinograms (~16 GB each) at once, via
         in-place differencing; reconstructs only a z-slab.  Peak ≈ 32 GB + recon.
@@ -52,7 +52,7 @@ from helical_reconstruction import (
     build_geom, detect_defect_channels, reconstruct_helical_stack,
     z_targets_for_full_scan, auto_hu_calibrate, apply_hu_calibration)
 # Reuse the label-free analysis primitives from the image-domain study (no duplication).
-from bin_separation_investigation import (
+from image_subtraction_investigation import (
     auto_body_mask, auto_water_mask, auto_detect_inserts, disk_mask,
     noise_from_highpass, cnr_sd)
 
@@ -62,7 +62,7 @@ sys.stdout.reconfigure(line_buffering=True)
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = _REPO_ROOT / "output" / "research" / "sinogram_separation"
+OUT_DIR = _REPO_ROOT / "output" / "research" / "sinogram_subtraction"
 
 # Raw data (same as the production driver).
 DATA_PATH = Path(r"/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/full_sinogram_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.Körper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat")
@@ -358,14 +358,14 @@ def main():
         "sino_vs_image_agreement": {f"E{b+1}": agree[b] for b in range(4)},
         "mean_cnr": {"sino_exclusive": cnr_sin, "image_exclusive": cnr_img, "n_features": len(feats)},
     }
-    (OUT_DIR / "sinogram_separation_metrics.json").write_text(json.dumps(metrics, indent=2))
+    (OUT_DIR / "sinogram_subtraction_metrics.json").write_text(json.dumps(metrics, indent=2))
 
-    _save_negativity_fig(neg, OUT_DIR / "sinsep_negativity.png")
-    _save_panels(cum_stack, sin_stack, img_stack, OUT_DIR / "sinsep_panels.png")
-    _save_sino_vs_image(sin_stack, img_stack, OUT_DIR / "sinsep_sino_vs_image.png")
-    _write_findings(metrics, OUT_DIR / "sinogram_separation_findings.md")
-    print(f"\n[done] metrics  → {OUT_DIR / 'sinogram_separation_metrics.json'}")
-    print(f"[done] findings → {OUT_DIR / 'sinogram_separation_findings.md'}")
+    _save_negativity_fig(neg, OUT_DIR / "sinogram_subtraction_negativity.png")
+    _save_panels(cum_stack, sin_stack, img_stack, OUT_DIR / "sinogram_subtraction_panels.png")
+    _save_sino_vs_image(sin_stack, img_stack, OUT_DIR / "sinogram_subtraction_sino_vs_image.png")
+    _write_findings(metrics, OUT_DIR / "sinogram_subtraction_findings.md")
+    print(f"\n[done] metrics  → {OUT_DIR / 'sinogram_subtraction_metrics.json'}")
+    print(f"[done] findings → {OUT_DIR / 'sinogram_subtraction_findings.md'}")
     print(f"[verdict] {verdict}: worst E1..E3 projection-mean negativity "
           f"= {100*max(meanmap_negs):.1f}%")
 
@@ -411,11 +411,11 @@ def _write_findings(m, path):
         L.append(f"| E{b+1} [{EXCL_TAGS[b]}] | {m['mean_cnr']['sino_exclusive'][b]:.3g} | "
                  f"{m['mean_cnr']['image_exclusive'][b]:.3g} |")
     L += ["", "## Figures",
-          "- `sinsep_negativity.png` — per-bin projection-mean map + sample histogram (Q1).",
-          "- `sinsep_panels.png` — cumulative vs sino-exclusive vs image-exclusive (mid slice).",
-          "- `sinsep_sino_vs_image.png` — where the two subtraction domains diverge (Q2).", "",
+          "- `sinogram_subtraction_negativity.png` — per-bin projection-mean map + sample histogram (Q1).",
+          "- `sinogram_subtraction_panels.png` — cumulative vs sino-exclusive vs image-exclusive (mid slice).",
+          "- `sinogram_subtraction_sino_vs_image.png` — where the two subtraction domains diverge (Q2).", "",
           "## Relation to the image-domain study",
-          "This complements `bin_separation_investigation.py` / "
+          "This complements `image_subtraction_investigation.py` / "
           "[docs/BIN_SEPARATION_FINDINGS.md](../../docs/BIN_SEPARATION_FINDINGS.md): that study "
           "asked whether image-domain separation improves *image quality* (it does not). This one "
           "asks whether the *projection-domain* subtraction is physically valid and whether the "

@@ -1,5 +1,5 @@
 """
-bin_separation_investigation.py
+image_subtraction_investigation.py
 ───────────────────────────────
 INVESTIGATIVE, image-domain study of THRESHOLD SEPARATION FOR IMAGE QUALITY.
 NOT part of the production reconstruction, and NOT material decomposition — that
@@ -31,10 +31,10 @@ INPUT
 Loads output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz (your reconstructed
 volumes; no GPU needed).  Falls back to library reconstruction of a slab if absent.
 
-OUTPUT (output/research/bin_separation/)
+OUTPUT (output/research/image_subtraction/)
 ────────────────────────────────────────
-binsep_correlation.png, binsep_panels.png, bin_separation_metrics.json,
-bin_separation_findings.md.
+image_subtraction_correlation.png, image_subtraction_panels.png, image_subtraction_metrics.json,
+image_subtraction_findings.md.
 """
 
 import json
@@ -49,7 +49,7 @@ import numpy as np
 # regardless of the working directory.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 IN_DIR = _REPO_ROOT / "output" / "reconstruction"                 # reads reconstructed volumes
-OUT_DIR = _REPO_ROOT / "output" / "research" / "bin_separation"   # writes figures/metrics/findings
+OUT_DIR = _REPO_ROOT / "output" / "research" / "image_subtraction"   # writes figures/metrics/findings
 
 USE_HU = True
 VOL_PATTERN = "reconstruction_thr_{label}{hu}.nii.gz"
@@ -415,7 +415,7 @@ def main():
           f"exclusive={off_diagonal_energy(corr_excl):.3f}")
     print(f"  noise SD (high-pass) cum={np.round(sd_cum,1)}  "
           f"[slice-diff crosscheck {np.round(sd_diff,1)}]")
-    _save_corr_fig(corr_cum, corr_excl, OUT_DIR / "binsep_correlation.png")
+    _save_corr_fig(corr_cum, corr_excl, OUT_DIR / "image_subtraction_correlation.png")
 
     # ════════════ STAGE 2 — separation (the vehicle) ════════════
     print("\n=== STAGE 2: separation ===")
@@ -495,13 +495,13 @@ def main():
         except Exception as ex:
             notes.append(f"A-guided denoise skipped: {ex}")
 
-    _save_panels(stack, exclusive, den, z_mid, OUT_DIR / "binsep_panels.png")
+    _save_panels(stack, exclusive, den, z_mid, OUT_DIR / "image_subtraction_panels.png")
 
     # ════════════ report ════════════
-    (OUT_DIR / "bin_separation_metrics.json").write_text(json.dumps(metrics, indent=2))
+    (OUT_DIR / "image_subtraction_metrics.json").write_text(json.dumps(metrics, indent=2))
     _write_findings(metrics, notes, feats)
-    print(f"\n[done] metrics → {OUT_DIR/'bin_separation_metrics.json'}")
-    print(f"[done] report  → {OUT_DIR/'bin_separation_findings.md'}")
+    print(f"\n[done] metrics → {OUT_DIR/'image_subtraction_metrics.json'}")
+    print(f"[done] report  → {OUT_DIR/'image_subtraction_findings.md'}")
 
 
 def _write_findings(metrics, notes, feats):
@@ -536,8 +536,8 @@ def _write_findings(metrics, notes, feats):
               f"(uses a spatial filter → check the edge ratio for blurring)"]
     L += ["", "## Notes / caveats"] + [f"- {n}" for n in notes]
     L += ["", "## Figures",
-          "- `binsep_correlation.png` — cumulative vs exclusive correlation matrices.",
-          "- `binsep_panels.png` — cumulative / exclusive / low-rank-denoised bins.",
+          "- `image_subtraction_correlation.png` — cumulative vs exclusive correlation matrices.",
+          "- `image_subtraction_panels.png` — cumulative / exclusive / low-rank-denoised bins.",
           "", "## Conclusion (image-quality goal)",
           "Separating the cumulative energy thresholds is mathematically clean "
           "(decorrelation 0.985 -> 0.000) but does **NOT** improve image quality. The "
@@ -556,7 +556,7 @@ def _write_findings(metrics, notes, feats):
           "step, where the small spectral component carries the material signal. (Noise "
           "figures here used an auto water ROI at ~+34 HU soft tissue; pin WATER_ROI to "
           "the Ø25 mm 0-HU calibration cylinder for a textbook-clean confirmation.)"]
-    (OUT_DIR / "bin_separation_findings.md").write_text("\n".join(L), encoding="utf-8")
+    (OUT_DIR / "image_subtraction_findings.md").write_text("\n".join(L), encoding="utf-8")
 
 
 if __name__ == "__main__":

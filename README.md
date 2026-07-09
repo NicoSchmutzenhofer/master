@@ -13,9 +13,10 @@ reconstruction/   reconstruction code
     helical_reconstruction.py             pure library (geometry, rebinning, MAR, FBP/SIRT/CGLS, HU calib)
     python_reconstruction.py              the driver (entry point; mode-switched at the top)
     recon_invariants.py                   invariant/assertion checks (append-only)
-    bin_separation_investigation.py       image-domain threshold-separation study (label-free)
-    sinogram_separation_investigation.py  sinogram-domain threshold-separation study (SIRT; needs raw .mat + GPU)
-    mat_info.py / mat_structure.py        .mat inspection diagnostics
+    image_subtraction_investigation.py      image-domain threshold subtraction study (label-free)
+    sinogram_subtraction_investigation.py   sinogram-domain threshold subtraction study (SIRT; raw .mat + GPU)
+    processed_separation_investigation.py   cumulative-vs-exclusive check (gain-invariant noise correlation)
+    mat_info.py / mat_structure.py          .mat inspection diagnostics
 geometry/         detector-geometry inputs: beta_*/zIso_* text files + Geo_P63.pdf datasheet
 docs/             IMAGE_QUALITY_PLAN.md, BIN_SEPARATION_FINDINGS.md, SOFTWARE_ROADMAP.md
 decomposition/    material-decomposition stage (Phase A+B; python -m decomposition.decompose)
@@ -23,7 +24,9 @@ output/           run outputs (gitignored): reconstruction/ · research/<name>/ 
 logs/             SLURM logs (gitignored)
 CLAUDE.md         detailed developer guidance (architecture, invariants, knobs)
 batch.sh          SLURM submit script (reconstruction + decomposition)
-batch_sinogram.sh SLURM submit script (sinogram-separation investigation)
+batch_image.sh    SLURM submit script (image-domain subtraction investigation)
+batch_sinogram.sh SLURM submit script (sinogram-domain subtraction investigation)
+batch_processed.sh SLURM submit script (cumulative-vs-exclusive check)
 ```
 
 ## Running
@@ -52,10 +55,14 @@ volumes. See the knob table and architecture notes in [CLAUDE.md](CLAUDE.md).
   (cumulative thresholds share photons → correlated noise; see
   [docs/BIN_SEPARATION_FINDINGS.md](docs/BIN_SEPARATION_FINDINGS.md) and
   [docs/IMAGE_QUALITY_PLAN.md](docs/IMAGE_QUALITY_PLAN.md) §4a). Tooling kept for the decomposition step.
-- **Sinogram-domain separation:** standalone investigation
-  ([reconstruction/sinogram_separation_investigation.py](reconstruction/sinogram_separation_investigation.py))
+- **Sinogram-domain subtraction:** standalone investigation
+  ([reconstruction/sinogram_subtraction_investigation.py](reconstruction/sinogram_subtraction_investigation.py))
   testing whether subtracting threshold sinograms is quantum noise or a gain bias (the premise of
   invariant #3) and whether it feeds decomposition. Does not change the production pipeline.
+- **Cumulative vs already-exclusive:** standalone diagnostic
+  ([reconstruction/processed_separation_investigation.py](reconstruction/processed_separation_investigation.py))
+  using the gain-invariant inter-threshold noise correlation to determine whether the
+  Siemens-processed thresholds are cumulative (nested) or already-separated energy bins.
 - **Material decomposition:** Phase A+B implemented (image-domain least-squares + data-adaptive
   WLS / edge-preserving denoise / joint estimators; see `decomposition/`). Reads our reconstruction
   (`output/reconstruction/`) by default; DICOM/Siemens input switchable.

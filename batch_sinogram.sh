@@ -23,9 +23,9 @@
 # Time  : scales with the study slab and N_ITER, both set at the top of the
 #         script (SLICE_IDX / N_SLAB_SLICES / N_ITER; defaults 41-slice slab,
 #         SIRT ×100). Shrink N_SLAB_SLICES for a quick first pass.
-# Output: output/research/sinogram_separation/
-#           sinogram_separation_findings.md, sinogram_separation_metrics.json,
-#           sinsep_negativity.png, sinsep_panels.png, sinsep_sino_vs_image.png
+# Output: output/research/sinogram_subtraction/
+#           sinogram_subtraction_findings.md, sinogram_subtraction_metrics.json,
+#           sinogram_subtraction_negativity.png, sinogram_subtraction_panels.png, sinogram_subtraction_sino_vs_image.png
 #
 # Submit with:  sbatch batch_sinogram.sh
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,4 +40,4 @@ conda activate /home/nisc24/.conda/envs/MatDecomp
 cd "$SLURM_SUBMIT_DIR"
 
 # 4. Run the investigation (standalone script; SIRT settings are at the top of it)
-python reconstruction/sinogram_separation_investigation.py
+python reconstruction/sinogram_subtraction_investigation.py
