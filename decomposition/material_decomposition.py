@@ -30,6 +30,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,7 @@ class DecompConfig:
 
     # --- I/O (used by the driver; the library decompose() takes arrays) ----
     input_format: str = "nifti"          # 'nifti' (our own recon) | 'dicom' (Siemens series)
+    input_source: str = ""               # provenance label for outputs/reliability: 'own'|'wfbp'|'vmi'
     input_dir: Optional[str] = None
     input_pattern: str = "reconstruction_thr_{label}_HU.nii.gz"
     threshold_labels: Tuple[str, ...] = ("A", "B", "C", "D")
@@ -142,12 +144,17 @@ def hu_to_linear_attenuation(hu: np.ndarray, mu_water: float) -> np.ndarray:
 
 
 def form_bin_measurements(vols_mu: np.ndarray, bin_domain: str) -> np.ndarray:
-    """Per-threshold linear attenuation (4, ...) -> measurement stack B (n_bins, ...)."""
+    """
+    Per-channel linear attenuation (N, ...) -> measurement stack B (N, ...).
+      'exclusive'  : subtract adjacent cumulative thresholds (A-B, ...) -- 4-threshold data only.
+      'cumulative' : feed the thresholds as-is.
+      'direct'     : feed the channels as-is (monoenergetic VMI, or any non-subtracted input).
+    """
     if bin_domain == "exclusive":
         return cumulative_to_exclusive(vols_mu)
-    if bin_domain == "cumulative":
+    if bin_domain in ("cumulative", "direct"):
         return np.asarray(vols_mu)
-    raise ValueError(f"bin_domain must be 'exclusive' or 'cumulative', got '{bin_domain}'")
+    raise ValueError(f"bin_domain must be 'exclusive'|'cumulative'|'direct', got '{bin_domain}'")
 
 
 def solve_ols(B: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -237,18 +244,68 @@ def stability_report(M: np.ndarray, materials: Sequence[str]) -> dict:
     }
 
 
+def reliability_report(M: np.ndarray, materials: Sequence[str]) -> dict:
+    """
+    Per-material reliability of the operator the solver actually inverts (M, or the effective
+    diag(1/gains)@M). Flags which material(s) are likely DEGENERATE -- amplified by
+    ill-conditioning / sitting in the near-null direction -- so a noise-dominated map is
+    recognised as expected, not a bug. Generic: for VMIs (effective rank ~2, 3 materials) it
+    auto-flags the under-determined material.
+    """
+    materials = list(materials)
+    s = np.linalg.svd(M, compute_uv=False)
+    _, _, Vt = np.linalg.svd(M, full_matrices=False)
+    kappa = float(s[0] / s[-1]) if s[-1] > 1e-30 else float("inf")
+    amp = np.sqrt(np.clip(np.diag(_safe_inv(M.T @ M)), 0, None))
+    eff_rank = int(np.sum(s > 1e-2 * s[0]))
+    null_dom = materials[int(np.argmax(np.abs(Vt[-1])))]
+
+    def _v(a: float) -> str:
+        return "RELIABLE" if a < 1.0 else "OK" if a < 3.0 else "POOR" if a < 10.0 else "DEGENERATE"
+
+    per = {m: {"noise_amplification": float(a), "verdict": _v(a)} for m, a in zip(materials, amp)}
+    degenerate = [m for m, a in zip(materials, amp) if a >= 3.0]
+    if not degenerate and eff_rank < len(materials):      # rank-deficient -> flag the worst
+        degenerate = [materials[int(np.argmax(amp))]]
+    return {
+        "condition_number": kappa,
+        "effective_rank": eff_rank,
+        "n_materials": len(materials),
+        "singular_values": s.tolist(),
+        "per_material": per,
+        "null_dominant_material": null_dom,
+        "likely_degenerate": degenerate,
+    }
+
+
+def _print_reliability(rel: dict, mode: str, source: str, n_channels: int) -> None:
+    """Prominent, greppable reliability block -> stdout (captured in the SLURM .out)."""
+    L = ["=" * 62,
+         f"[DECOMP RELIABILITY]  mode={mode}  source={source or '?'}  channels={n_channels}",
+         f"  kappa(M_eff)={rel['condition_number']:.3g}   effective rank ~{rel['effective_rank']}"
+         f" of {rel['n_materials']} materials",
+         "  per-material noise amplification (higher = less reliable):"]
+    for m, d in rel["per_material"].items():
+        flag = ("   *** LIKELY DEGENERATE -- treat this map as unreliable, not a pipeline bug ***"
+                if m in rel["likely_degenerate"] else "")
+        L.append(f"     {m:16s} {d['noise_amplification']:9.3f}   {d['verdict']}{flag}")
+    if rel["likely_degenerate"]:
+        L.append(f"  => expect {', '.join(rel['likely_degenerate'])} to look noise-dominated for "
+                 f"spectral (conditioning) reasons, not a bug.")
+    L.append("=" * 62)
+    print("\n".join(L))
+
+
 # ============================================================================
 # Water calibration (unit scaling; not a stability remedy, so estimator-agnostic)
 # ============================================================================
 def _water_reference(bin_domain: str, option: int, mu_water: Optional[np.ndarray]) -> np.ndarray:
-    """Expected water linear attenuation (1/cm) per bin, from NIST (density 1.0 g/cm^3)."""
-    water_mass = mlib.material_signature("Water", option)
-    rho = mlib.material_info("Water").density_g_cm3
+    """Expected water linear attenuation (1/cm) per channel (density 1.0 g/cm^3)."""
     if bin_domain == "exclusive":
-        return water_mass * rho
-    if mu_water is not None:
+        return mlib.material_signature("Water", option) * mlib.material_info("Water").density_g_cm3
+    if mu_water is not None:                       # cumulative/direct: per-channel physical water mu
         return np.asarray(mu_water, dtype=float)
-    return water_mass * rho
+    return mlib.material_signature("Water", option) * mlib.material_info("Water").density_g_cm3
 
 
 def estimate_water_gains(B: np.ndarray, water_mask: np.ndarray,
@@ -419,36 +476,58 @@ def _joint_spatial_update(vols_mu, gains, M, config, n_mat, zflat, mu, cancel):
 def decompose(volumes: np.ndarray, config: DecompConfig,
               mu_water: Optional[Sequence[float]] = None,
               water_mask: Optional[np.ndarray] = None,
+              channels: Optional[Sequence] = None,
               progress: ProgressCB = None, cancel: CancelCB = None) -> DecompResult:
     """
-    Decompose 4 reconstructed threshold volumes into per-material density maps.
+    Decompose N reconstructed energy-channel volumes into per-material density maps.
 
-    volumes  : (4, Z, Y, X) cumulative threshold volumes in HU (order A..D = >=20..>=75 keV),
-               or linear attenuation if config.hu_input is False.
-    mu_water : (4,) per-threshold water attenuation for HU->mu; if None and hu_input, a nominal
-               constant is used (absolute density scale then relies on water_calibration).
-    water_mask : optional bool (Z,Y,X) water ROI; if None and water_calibration, auto-detected
-               as |HU_A| < config.water_hu_tol.
+    volumes  : (N, Z, Y, X) in HU (or linear attenuation if config.hu_input is False). N is the
+               number of energy channels the data actually has -- NOT fixed at 4.
+    channels : optional list of material_library.Channel describing each volume's energy (threshold
+               window or monoenergetic VMI keV). If None, derived from config.threshold_option
+               (back-compat: N = that option's threshold-bin count, e.g. 4).
+    mu_water : optional per-channel water attenuation override for HU->mu; if None and hu_input, the
+               physical per-channel water mu is generated from the channel energies.
+    water_mask : optional bool (Z,Y,X) water ROI; auto-detected as |HU_channel0| < tol if None.
     """
     def _p(frac, msg):
         if progress:
             progress(float(frac), msg)
 
     volumes = np.asarray(volumes, dtype=np.float32)   # float32 storage; per-chunk math upcasts
-    if volumes.ndim != 4 or volumes.shape[0] != 4:
-        raise ValueError(f"volumes must be (4,Z,Y,X); got {volumes.shape}")
+    if volumes.ndim != 4:
+        raise ValueError(f"volumes must be (N, Z, Y, X); got {volumes.shape}")
+    N = int(volumes.shape[0])
     Z, Y, X = int(volumes.shape[1]), int(volumes.shape[2]), int(volumes.shape[3])
 
     spec = modes.get_mode(config.mode)
     materials = list(spec.materials)
-    M = mlib.build_M(materials, config.threshold_option)
-    n_bins, n_mat = M.shape
-    if n_bins != volumes.shape[0]:
-        raise ValueError(f"M has {n_bins} bins but {volumes.shape[0]} volumes supplied")
 
-    _p(0.02, f"mode '{config.mode}' [{'/'.join(materials)}] -- stability audit")
+    # Channels come from the loader (arbitrary count / kind); else derived from the threshold option.
+    if channels is None:
+        channels = mlib.threshold_channels(config.threshold_option)
+    channels = list(channels)
+    if len(channels) != N:
+        raise ValueError(f"{N} volumes supplied but {len(channels)} channels described")
+
+    # Monoenergetic (VMI) channels are not cumulative thresholds -> never subtract them.
+    if any(c.kind == "mono" for c in channels) and config.bin_domain != "direct":
+        if config.bin_domain == "exclusive":
+            warnings.warn("bin_domain='exclusive' is meaningless for monoenergetic (VMI) channels "
+                          "(not cumulative thresholds); coercing to 'direct'.")
+        config = dataclasses.replace(config, bin_domain="direct")
+
+    M = mlib.build_M(materials, channels)             # (N, n_mat); signatures generated per channel
+    n_bins, n_mat = M.shape
+    if n_bins != N:
+        raise ValueError(f"M has {n_bins} rows but {N} volumes supplied")
+    if n_bins < n_mat:
+        raise ValueError(f"underdetermined: {n_bins} energy channels < {n_mat} materials "
+                         f"({'/'.join(materials)}); provide >= {n_mat} channels or fewer materials")
+
+    _p(0.02, f"mode '{config.mode}' [{'/'.join(materials)}] -- {n_bins} channels, stability audit")
     stability = stability_report(M, materials)
-    logger.info("mode %s: kappa=%.3g (%s)", config.mode,
+    logger.info("mode %s: %d channels, kappa=%.3g (%s)", config.mode, n_bins,
                 stability["condition_number"], stability["verdict"])
 
     # HU -> linear attenuation (per cumulative threshold) --------------------
@@ -458,9 +537,7 @@ def decompose(volumes: np.ndarray, config: DecompConfig,
     # it across estimators/domains), so we build a separate buffer rather than converting in place.
     if config.hu_input:
         if mu_water is None:
-            mu_water = np.full(n_bins, 0.20)
-            warnings.warn("mu_water not provided; using nominal 0.20 /cm. Absolute density "
-                          "scale relies on water_calibration.")
+            mu_water = np.array([mlib.channel_water_mu(c) for c in channels], dtype=float)
         mu_water = np.asarray(mu_water, dtype=float)
         # Water ROI must be read in the HU domain, before the conversion.
         if config.water_calibration and water_mask is None:
@@ -483,9 +560,13 @@ def decompose(volumes: np.ndarray, config: DecompConfig,
             gains = estimate_water_gains(B_probe, water_mask, reference)
             del B_probe
 
+    # Reliability on the EFFECTIVE operator the solver inverts (M scaled by the per-channel gains).
+    reliability = reliability_report(M / gains[:, None], materials)
+    _print_reliability(reliability, config.mode, config.input_source, n_bins)
+
     # Estimator dispatch ------------------------------------------------------
     est = config.estimator
-    _p(0.06, f"estimator '{est}', noise '{config.noise_model}'")
+    _p(0.06, f"estimator '{est}', noise '{config.noise_model}', bin_domain '{config.bin_domain}'")
     if est == "ols":
         maps, residual = _solve_linear_chunked(vols_mu, gains, M, np.linalg.pinv(M),
                                                config, n_mat, _p, cancel)
@@ -508,21 +589,28 @@ def decompose(volumes: np.ndarray, config: DecompConfig,
         maps = _denoise_stack(maps, config)
 
     material_maps = {m: maps[i] for i, m in enumerate(materials)}
+    all_threshold = all(c.kind == "threshold" for c in channels)
     metadata = {
         "mode": config.mode,
         "display_name": spec.display_name,
         "clinical_question": spec.clinical_question,
         "materials": materials,
-        "threshold_option": config.threshold_option,
-        "bin_edges_keV": mlib.bin_edges(config.threshold_option),
+        "input_source": config.input_source,
+        "n_channels": n_bins,
+        "channels": [{"kind": c.kind, "label": c.label, "energy_keV": c.energy_keV,
+                      "window_keV": (list(c.window_keV) if c.window_keV else None)}
+                     for c in channels],
+        "threshold_option": config.threshold_option if all_threshold else None,
+        "bin_edges_keV": mlib.bin_edges(config.threshold_option) if all_threshold else None,
         "bin_domain": config.bin_domain,
         "estimator": config.estimator,
         "noise_model": config.noise_model,
         "denoise": ({"method": config.denoise_method, "scale": config.denoise_scale,
                      "guide": config.denoise_guide}
                     if est in ("wls_denoise", "wls_joint") else None),
-        "mu_water_per_threshold": None if mu_water is None else mu_water.tolist(),
+        "mu_water_per_channel": None if mu_water is None else mu_water.tolist(),
         "water_calibration_gains": gains.tolist(),
+        "reliability": reliability,
         "volume_shape": [int(Z), int(Y), int(X)],
     }
     _p(1.0, "done")
@@ -788,6 +876,151 @@ def load_threshold_volumes(config: DecompConfig):
         ref = ref[:, :, z0:z1]
     mu_water = read_recon_calibration(config)
     return vols, ref, mu_water
+
+
+# ============================================================================
+# N-channel energy-stack loaders -- one pipeline, three loaders (own / VMI / WFBP).
+# Each returns (volumes (N,Z,Y,X) float32, channels: List[mlib.Channel], ref sitk image).
+# The channel COUNT/kind comes from the data; decompose() builds the matching M.
+# ============================================================================
+def load_own_energy_stack(config: DecompConfig):
+    """Our reconstruction: the threshold NIfTIs present in input_dir. Uses however many
+    threshold_labels actually exist (3 works), each mapped to its threshold-option window."""
+    sitk = _sitk()
+    if not config.input_dir:
+        raise ValueError("own input needs config.input_dir")
+    d = Path(config.input_dir)
+    edges = mlib.bin_edges(config.threshold_option)
+    present = []
+    for i, lbl in enumerate(config.threshold_labels):
+        p = d / config.input_pattern.format(label=lbl)
+        if p.exists():
+            if i >= len(edges):
+                raise ValueError(f"threshold '{lbl}' (#{i}) has no window in option "
+                                 f"{config.threshold_option} ({len(edges)} bins)")
+            present.append((mlib.Channel(kind="threshold", label=lbl, window_keV=edges[i],
+                                         option=config.threshold_option, bin_index=i), p))
+    if not present:
+        raise FileNotFoundError(f"No threshold volumes in {d} "
+                                f"(pattern {config.input_pattern.format(label='?')})")
+    channels = [c for c, _ in present]
+    paths = [p for _, p in present]
+    img0 = sitk.ReadImage(str(paths[0]))
+    ref = img0
+    z0, z1 = ((0, ref.GetSize()[2]) if config.z_slab_mm is None
+              else _slab_slice(ref, config.z_slab_mm))
+    vols = None
+    for j, p in enumerate(paths):
+        img = img0 if j == 0 else sitk.ReadImage(str(p))
+        a = sitk.GetArrayFromImage(img).astype(np.float32)[z0:z1]
+        if img is not img0:
+            del img
+        if vols is None:
+            vols = np.empty((len(paths),) + a.shape, dtype=np.float32)
+        elif a.shape != vols.shape[1:]:
+            raise ValueError(f"own volumes mismatched shapes: {a.shape} vs {vols.shape[1:]}")
+        vols[j] = a
+        del a
+    if config.z_slab_mm is not None:
+        ref = ref[:, :, z0:z1]
+    logger.info("own recon: %d threshold channels %s", len(channels), [c.label for c in channels])
+    return vols, channels, ref
+
+
+def _classify_series(desc: str, path: str):
+    """Series -> ('mono', keV) | ('threshold', n) | None, parsed from description or folder name."""
+    text = f"{desc or ''} {path or ''}"
+    m = re.search(r"Mono[_ ]*([0-9]+(?:\.[0-9]+)?)\s*keV", text, re.IGNORECASE)
+    if m:
+        return ("mono", float(m.group(1)))
+    m = re.search(r"WFBP[_ ]*T([0-9]+)", text, re.IGNORECASE) or re.search(r"[_ /\\]T([0-9]+)[_ ]", text)
+    if m:
+        return ("threshold", int(m.group(1)))
+    return None
+
+
+def _read_series_volume(sitk, files, z_slab_mm):
+    """Read one DICOM series (list of [z, path]) as a float32 (Z,Y,X) array (slab-limited)."""
+    r = sitk.ImageSeriesReader()
+    r.SetFileNames(_slab_files(files, z_slab_mm))
+    img = r.Execute()
+    return sitk.GetArrayFromImage(img).astype(np.float32), img
+
+
+def load_siemens_energy_stack(config: DecompConfig, kind: str):
+    """
+    Siemens DICOM export -> auto-discovered channels of one product.
+      kind='vmi'  : all 'Mono <keV>' monoenergetic series  -> mono channels (sorted by keV).
+      kind='wfbp' : all 'WFBP T<n>' threshold series        -> threshold channels (sorted by n).
+    Series are classified from SeriesDescription (or the folder name), so the channel COUNT is
+    whatever the folder contains -- 2, 4, 8, or 13 VMIs -- never hardcoded.
+    """
+    sitk = _sitk()
+    folder = config.dicom_dir or config.input_dir
+    if not folder:
+        raise ValueError("Siemens input needs config.dicom_dir")
+    want = "mono" if kind == "vmi" else "threshold"
+    cache = str(Path(config.output_dir) / "dicom_index.json") if config.output_dir else None
+    index = build_dicom_index(folder, cache_path=cache)
+    edges = mlib.bin_edges(config.threshold_option)
+
+    found = []  # (sort_key, Channel, uid, files)
+    for uid, s in index.items():
+        path0 = s["files"][0][1] if s["files"] else ""
+        spec = _classify_series(s.get("desc", ""), path0)
+        if not spec or spec[0] != want:
+            continue
+        if want == "mono":
+            e = spec[1]
+            ch = mlib.Channel(kind="mono", label=f"{e:g}keV", energy_keV=e)
+            found.append((e, ch, uid, s["files"]))
+        else:
+            n = spec[1]
+            if n - 1 >= len(edges):
+                continue
+            ch = mlib.Channel(kind="threshold", label=f"T{n}", window_keV=edges[n - 1],
+                              option=config.threshold_option, bin_index=n - 1)
+            found.append((n, ch, uid, s["files"]))
+    if not found:
+        disc = [(s.get("number"), s.get("desc")) for s in index.values()]
+        raise ValueError(f"No '{kind}' series found under {folder}. Discovered (number, desc): {disc}")
+
+    found.sort(key=lambda t: t[0])
+    channels = [c for _, c, _, _ in found]
+    logger.info("Siemens %s: %d channels %s", kind, len(channels), [c.label for c in channels])
+
+    vols, ref = None, None
+    for i, (_key, ch, uid, files) in enumerate(found):
+        a, img = _read_series_volume(sitk, files, config.z_slab_mm)
+        if ref is None:
+            ref = img
+        elif img is not ref:
+            del img
+        if vols is None:
+            vols = np.empty((len(found),) + a.shape, dtype=np.float32)
+        elif a.shape != vols.shape[1:]:
+            raise ValueError(f"Siemens {kind} series have mismatched shapes ({a.shape} vs "
+                             f"{vols.shape[1:]}) -- differing matrix size / slab across series?")
+        vols[i] = a
+        del a
+        logger.info("  %s <- series #%s (%s): %d slices",
+                    ch.label, index[uid]["number"], uid[-8:], vols.shape[1])
+    return vols, channels, ref
+
+
+def load_energy_stack(config: DecompConfig):
+    """
+    Load an (N,Z,Y,X) volume stack + its channel descriptors + reference image, dispatching on
+    config.input_source: 'own' (our NIfTI recon), 'wfbp' (Siemens threshold DICOM), 'vmi' (Siemens
+    monoenergetic DICOM).  N is whatever the data provides -- the one shared entry point the driver
+    uses so the pipeline is identical across all three approaches (only this loader differs).
+    """
+    src = (config.input_source or ("own" if config.input_format == "nifti" else "")).lower()
+    if src == "own":
+        return load_own_energy_stack(config)
+    if src in ("vmi", "wfbp"):
+        return load_siemens_energy_stack(config, src)
+    raise ValueError(f"config.input_source must be 'own'|'wfbp'|'vmi' (got {config.input_source!r})")
 
 
 def save_decomp_result(result: DecompResult, ref, out_dir) -> List[Path]:

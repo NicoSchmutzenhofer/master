@@ -20,18 +20,27 @@ conda activate /home/nisc24/.conda/envs/MatDecomp
 # Run from the repo root (the directory sbatch was submitted from)
 cd "$SLURM_SUBMIT_DIR"
 
-# 3. Run the command (specify your command)
-#
-# --- Reconstruction (produces the per-threshold volumes the decomposition reads) ---
-# Uncomment to (re)build the volumes first; this is the step that needs the GPU
-# (--gres above). Skip it if output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz already exist.
+# 3. Material decomposition -- pick the INPUT SOURCE as the first sbatch argument:
+#      sbatch batch.sh own     # our reconstruction  (output/reconstruction/*_HU.nii.gz)
+#      sbatch batch.sh vmi     # Siemens monoenergetic (VMI) DICOMs
+#      sbatch batch.sh wfbp    # Siemens WFBP threshold DICOMs
+#   Default (no arg) = own. Output -> output/decomposition/<source>/.
+#   Decomposition is CPU-only; the --gres GPU line above is only needed for the reconstruction
+#   stanza below (drop --gres for a pure CPU slot if your scheduler allows).
+SOURCE="${1:-own}"
+export DECOMP_SOURCE="$SOURCE"
+echo "=== material decomposition: source=$SOURCE ==="
+
+# --- (optional) (re)build our per-threshold volumes first; needs the GPU. Skip for vmi/wfbp,
+#     or if output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz already exist. ---
 # python reconstruction/python_reconstruction.py
-#
-# --- Material decomposition, Phase A (CPU only; runs in order, stops on first error) ---
-#   1) self-test (math sanity)   2) decompose (material maps + stability)   3) research (figures)
+
+# self-test (math sanity) -> decompose the chosen source (stops on first error)
 python -m decomposition.selftest_decomposition \
-  && python -m decomposition.decompose \
-  && python -m decomposition.research_decomposition
+  && python -m decomposition.decompose
+
+# --- (optional) research ablations on our own recon (source-independent; needs the NIfTI volumes) ---
+# python -m decomposition.research_decomposition
 
 # 4. Move logs to permanent location  
 # mv /tmp/logs/${SLURM_JOB_ID}_result.out ./logs/  
