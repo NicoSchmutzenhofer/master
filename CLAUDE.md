@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Master's thesis code for **4-bin photon-counting CT (PCCT) reconstruction** on the Siemens NAEOTOM Alpha scanner (P63 detector, M4 collimation mode). The pipeline performs **Single-Slice Rebinning (SSR) helical reconstruction** of each of the 4 energy threshold sinograms independently — the per-threshold volumes are then the input for downstream material decomposition.
 
-A Git repository organised into folders: reconstruction code in `reconstruction/`, detector-geometry inputs in `geometry/`, design docs in `docs/`, and `decomposition/` holding the material-decomposition stage (Phases A+B: image-domain least-squares + data-adaptive WLS / edge-preserving denoise / joint estimators). `CLAUDE.md` and `batch.sh` stay at the repo root; `output/` and `logs/` are gitignored. No test suite or package config — a small set of standalone scripts.
+A Git repository organised into folders: reconstruction code in `reconstruction/`, detector-geometry inputs in `geometry/`, design docs in `docs/`, `decomposition/` holding the material-decomposition stage (Phases A+B: image-domain least-squares + data-adaptive WLS / edge-preserving denoise / joint estimators), and `thesis/` holding the LaTeX write-up. `CLAUDE.md`, `README.md` and the `batch*.sh` scripts stay at the repo root; `output/`, `output_old/`, `logs/` **and `geometry/`** are gitignored — a fresh clone therefore has no detector-geometry text files and `build_geom` fails until they are copied in by hand. No test suite or package config — a small set of standalone scripts. The only executable "test" is `python -m decomposition.selftest_decomposition` (synthetic math self-test, no data needed).
 
 ## Running
 
@@ -14,27 +14,33 @@ The working directory on this Windows machine is a mirror of the code that actua
 
 ```bash
 # On the cluster — submit a job (node 'sauron', rtx6000ada GPU)
-sbatch batch.sh            # reconstruction + decomposition pipeline (toggle the stanzas inside)
+sbatch batch.sh own        # decomposition on our recon; arg is own|wfbp|vmi (default own)
 sbatch batch_image.sh      # image-domain subtraction investigation -> output/research/image_subtraction/
 sbatch batch_sinogram.sh   # sinogram-domain subtraction investigation -> output/research/sinogram_subtraction/
 sbatch batch_processed.sh  # cumulative-vs-exclusive check (noise correlation) -> output/research/processed_separation/
+sbatch batch_compare.sh    # recon-quality comparison vs Siemens WFBP/VMI -> output/research/recon_comparison/
 ```
 
-`batch.sh` activates the conda env `/home/nisc24/.conda/envs/MatDecomp` (Python + numpy, scipy, h5py, SimpleITK, astra-toolbox, pywavelets, scikit-image, matplotlib).
+`batch_compare.sh` runs the three comparison stages in order (probe → GPU sweep → metrics) and **skips sweep variants that already exist with a matching config**, so re-running it is cheap. Edit the three input paths at the top of the file; any extra argument is forwarded to `recon_comparison.py` (e.g. `sbatch batch_compare.sh --stage 2` for metrics only).
+
+`batch.sh` activates the conda env `/home/nisc24/.conda/envs/MatDecomp` (Python + numpy, scipy, h5py, SimpleITK, astra-toolbox, pywavelets, scikit-image, matplotlib). It passes its first argument through as **`$DECOMP_SOURCE`**, which `decompose.py` reads as `INPUT_SOURCE`. As checked in, it runs only `selftest_decomposition && decompose` (CPU-only, stops on first error); the **reconstruction** stanza (`python reconstruction/python_reconstruction.py`, the only part that needs the GPU) and the **research-ablation** stanza are commented out — uncomment them when you need them.
 
 ### Decomposition module
 
-Run from the repo root, after the reconstruction has produced `output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz` (confirm actual filenames on the cluster):
+Run from the repo root, after the reconstruction has produced `output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz`. Those names are a **hard contract between the two stages**: the driver writes `reconstruction_thr_{label}[_HU].nii.gz` + `calibration_thr_{label}.json`, and `DecompConfig.input_pattern` / `calibration_pattern` read exactly that pattern. `load_own_energy_stack` uses whichever threshold volumes are actually *present* (3 of 4 is legal — the channel count is discovered), so a renamed or missing file silently degrades the solve rather than raising.
 
 ```bash
+python -m reconstruction.selftest_image_quality      # image-quality metric self-test, no data needed
 python -m decomposition.selftest_decomposition      # math self-test (Phase A + B), no data needed
 python -m decomposition.research_decomposition       # κ tables + figures + findings, no volumes needed
 python -m decomposition.decompose                    # one mode on the real volumes (needs SimpleITK + data)
 ```
 
-`decompose.py` is switched by **`INPUT_SOURCE`** (`'own'` | `'wfbp'` | `'vmi'`) — **one shared pipeline, three loaders** (`material_decomposition.load_energy_stack`): our threshold reconstruction (NIfTI), Siemens WFBP thresholds, or Siemens monoenergetic VMIs (keV series auto-discovered from the DICOM folder). The energy-channel **count is discovered from the data, never fixed at 4** (3 own thresholds, 2/4 WFBP, or 8–13 VMIs all work); `M` is generated per channel from the NIST Excel — bin-averaged windows for thresholds (`data/mu_rho_binavg.csv`) or **K-edge-aware monoenergetic interpolation** for VMIs (`data/mu_rho_mono.csv`, regenerated by `build_mono_table.py`). Outputs go to **`output/decomposition/<source>/`** (own/wfbp/vmi never overwrite), and every run prints + stores a per-material **reliability** flag naming the likely-degenerate material (a K-edge-poor VMI 3-material solve is expected to be near-degenerate — the flag says so, so a noisy map isn't mistaken for a bug). Monoenergetic channels are never subtracted (`bin_domain='direct'`, auto-selected); the DICOM explicit-series loader (`DICOM_SERIES`) also remains as a fallback.
+`decompose.py` is switched by **`INPUT_SOURCE`** (`'own'` | `'wfbp'` | `'vmi'`) — **one shared pipeline, three loaders** (`material_decomposition.load_energy_stack`): our threshold reconstruction (NIfTI), Siemens WFBP thresholds, or Siemens monoenergetic VMIs (keV series auto-discovered from the DICOM folder). The energy-channel **count is discovered from the data, never fixed at 4** (3 own thresholds, 2/4 WFBP, or 8–13 VMIs all work); `M` is generated per channel from the NIST Excel — bin-averaged windows for thresholds (`data/mu_rho_binavg.csv`) or **K-edge-aware monoenergetic interpolation** for VMIs (`data/mu_rho_mono.csv`, regenerated by `build_mono_table.py`). Outputs go to **`output/decomposition/<source>/`** (own/wfbp/vmi never overwrite), and every run prints + stores a per-material **reliability** flag naming the likely-degenerate material (a K-edge-poor VMI 3-material solve is expected to be near-degenerate — the flag says so, so a noisy map isn't mistaken for a bug). Monoenergetic channels are never subtracted (`bin_domain='direct'`, auto-selected).
 
-`batch.sh`'s decomposition stanza runs these three in that order (CPU only, stops on first error). See [decomposition/README.md](decomposition/README.md) for the module layout and [decomposition/DECOMPOSITION_PLAN.md](decomposition/DECOMPOSITION_PLAN.md) for the stability analysis behind the estimator/material choices.
+The other constants at the top of `decompose.py` build the `DecompConfig`: `MODE` (clinical question → basis materials, see `decomposition_modes.list_modes()`), `ESTIMATOR` (`'ols'` → `'wls'` → `'wls_denoise'` → `'wls_joint'`; start at OLS as the rawest baseline), `NOISE_MODEL`, `THRESHOLD_OPTION` (threshold windows for own/wfbp; VMI ignores it), `BIN_DOMAIN` (`'cumulative'` | `'exclusive'`), `WATER_CALIBRATION`, `Z_SLAB_MM`, and `SIEMENS_DIR` (the Linux DICOM export root for wfbp/vmi).
+
+See [decomposition/README.md](decomposition/README.md) for the module layout and [decomposition/DECOMPOSITION_PLAN.md](decomposition/DECOMPOSITION_PLAN.md) for the stability analysis behind the estimator/material choices.
 
 ### Tuning loop
 
@@ -43,28 +49,30 @@ python -m decomposition.decompose                    # one mode on the real volu
 - `FAST_MODE = True` — slab preview for all 4 thresholds (~seconds/threshold). Use this when tuning preprocessing, MAR, or geometry. Reconstructs an image-domain average over `PREVIEW_SLAB_MM` (so preview SNR ≈ the full volume), HU-calibrates each threshold, and shows all four on the same `PREVIEW_HU_WL` window so HU separation is judged fairly. Outputs: `output/reconstruction/preview_4thresholds_fast.png` and `output/reconstruction/defect_mask_diagnostic.png` (cross-threshold defect-mask comparison).
 - `FAST_MODE = False` — full helical volumes for all 4 thresholds (~hours). Writes one raw-attenuation NIfTI and one HU-calibrated `_HU.nii.gz` per threshold, plus a 4D `reconstruction_4thr_multienergy.nii.gz`.
 
-Config knobs at the top of the driver (all have inline comment blocks explaining failure modes):
+Config knobs at the top of the driver (all have inline comment blocks explaining failure modes). The **"As checked in"** column is the value currently committed, which for several knobs is a *tuned* setting rather than the conservative library default described in the inline comment — read the value in the file, don't assume:
 
-| Knob | Default | What it does |
+| Knob | As checked in | What it does |
 |---|---|---|
-| `FAST_MODE` | `True` | Single-slice/slab preview vs full volume |
-| `RECON_METHOD` | `'fbp'` | Reconstruction algorithm: `'fbp'` (default, established) / `'sirt'` / `'cgls'` (iterative, ASTRA). FBP behaviour is unchanged while `'fbp'`. |
-| `N_ITER` | `150` | Iterations for `'sirt'`/`'cgls'` (ignored for FBP). Full-volume iterative is ~2·N_ITER× slower per slice — use deliberately |
-| `PREVIEW_SLAB_MM` | `2.0` | FAST preview: image-domain average over this slab thickness so preview SNR ≈ full volume. `0` = single native slice |
+| `FAST_MODE` | `False` | Single-slice/slab preview vs full volume |
+| `N_PIXELS` / `FOV_MM` | `512` / `500.0` | Reconstruction grid and field of view (mm); together they set the in-plane voxel size |
+| `RECON_METHOD` | `'sirt'` | Reconstruction algorithm: `'fbp'` (established baseline) / `'sirt'` / `'cgls'` (iterative, ASTRA). FBP behaviour is unchanged while `'fbp'`. |
+| `N_ITER` | `100` | Iterations for `'sirt'`/`'cgls'` (ignored for FBP). Full-volume iterative is ~2·N_ITER× slower per slice — use deliberately |
+| `PREVIEW_SLAB_MM` | `3.0` | FAST preview: image-domain average over this slab thickness so preview SNR ≈ full volume. `0` = single native slice |
 | `SPIKE_MAD_K` / `IPR_MAD_K` | `5.0` / `6.0` | Defect-detection MAD multipliers; **raise** to mask fewer channels (see `output/reconstruction/defect_mask_diagnostic.png`) |
 | `PREVIEW_HU_WL` | `(40, 400)` | HU window `(level, width)` for the FAST preview when HU calibration is on |
-| `FILTER_NAME` | `'shepp-logan'` | FBP filter. Use `'ram-lak'` for MTF/geometry tests only |
+| `FILTER_NAME` | `'hann'` | FBP filter (`'shepp-logan'` is the documented quantitative default, ~Siemens Qr40). Use `'ram-lak'` for MTF/geometry tests only |
 | `GEOMETRY_MODEL` | `'curved'` | `'curved'` = correct equiangular→flat remap; `'flat'` = legacy |
 | `Z_WEIGHTING` | `'balanced'` | Helical rebinning weight: `'balanced'` (angularly-balanced 360°LI — removes the rotating low-frequency "light cone") / `'hann'` (legacy raised-cosine z-window, the rotating lobe) / `'none'` (uniform). Sinogram-formation only, so FBP/SIRT/CGLS all benefit |
 | `WAVELET_RING_THRESHOLD` | `2.0` | Gate for adaptive wavelet stripe removal; `0` = always on, `999` = always off |
 | `ENABLE_HU_CALIBRATION` | `True` | Auto-detect µ_water/µ_air and write HU-scaled NIfTIs |
-| `Z_SMOOTH_MM` | `0.0` | Post-recon Gaussian z-smoothing (FWHM mm). 1.5–3 for SNR boost on low-contrast inserts |
+| `Z_SMOOTH_MM` | `3.0` | Post-recon Gaussian z-smoothing (FWHM mm). `0` = off (native 0.4 mm); 1.5–3 for SNR boost on low-contrast inserts |
 | `MAR_STRENGTH` | `0.0` | Metal artifact reduction blend (0 = off) |
 | `HAMPEL_THRESHOLD` | `None` | Per-projection spike suppression (None = off) |
+| `PATIENT_POSITION` | `'HFS'` | Array→patient (LPS) axis labelling only; not in the raw descriptor (see invariant #8) |
 
 ### Diagnostic scripts
 
-Before touching reconstruction code, when the `.mat` file format is unfamiliar:
+A scan is **two `.mat` files in different formats**, and the driver reads them with two different libraries: the sinogram (`full_sinogram_*.raw.mat`) is MATLAB v7.3/HDF5 and is opened lazily with `h5py` (it is ~16 GB per threshold — never `loadmat` it), while the descriptor (`descriptor_*.raw.mat`) is a MATLAB v5 struct read eagerly with `scipy.io.loadmat(..., struct_as_record=True, squeeze_me=False)` and unwrapped as `desc_data['descriptor'].flat[0]`. Both paths are hardcoded near the top of the driver. Hence the two diagnostics, for when the format is unfamiliar:
 - [mat_info.py](reconstruction/mat_info.py) — detects MATLAB v5 vs v7.3/HDF5, prints top-level variable shapes.
 - [mat_structure.py](reconstruction/mat_structure.py) — recursive struct/cell inspector. Used to map out `descriptor.Config`, `descriptor.ScanDescr`, etc.
 
@@ -72,10 +80,11 @@ Before touching reconstruction code, when the `.mat` file format is unfamiliar:
 
 ### File layout
 
-Folders (entry points `batch.sh` and `CLAUDE.md` stay at the root; `output/`, `logs/` are gitignored). Run outputs are split by stage: **`output/reconstruction/`** (driver: NIfTIs, calibration JSONs, previews, `invariant_log.json`), **`output/research/<name>/`** (investigations + decomposition ablations), **`output/decomposition/`** (material maps):
-- `reconstruction/` — all reconstruction code (library, driver, invariants, `.mat` diagnostics, and the two threshold-separation investigations).
+Folders (entry points `batch*.sh`, `README.md` and `CLAUDE.md` stay at the root; `output/`, `output_old/`, `logs/`, `geometry/` are gitignored). Run outputs are split by stage: **`output/reconstruction/`** (driver: NIfTIs, calibration JSONs, previews, `invariant_log.json`), **`output/research/`** (decomposition ablations at the top level, each reconstruction investigation in its own `<name>/` subfolder), **`output/decomposition/<source>/`** (material maps, one subfolder per input source):
+- `reconstruction/` — all reconstruction code (library, driver, invariants, `.mat` diagnostics, and the three threshold-separation investigations).
 - `geometry/` — detector-geometry inputs (`beta_*`/`zIso_*` text files + `Geo_P63.pdf`).
 - `docs/` — design/roadmap docs.
+- `thesis/` — the LaTeX write-up (see below).
 - `decomposition/` — material-decomposition stage (Phases A+B: image-domain LS + stability audit; data-adaptive WLS / edge-preserving denoise / joint estimators, all selectable). **N-channel and multi-source**: one pipeline over our threshold recon, Siemens WFBP thresholds, or Siemens VMIs (`INPUT_SOURCE`), with the channel count discovered from the data and `M` generated per channel (K-edge-aware for VMI). A Python package (`python -m decomposition.decompose`) with its own `DECOMPOSITION_PLAN.md` / `README.md`.
 
 - **[helical_reconstruction.py](reconstruction/helical_reconstruction.py)** — pure library, no I/O of raw data, no `__main__`. All algorithm code: geometry build, defect detection, rebinning, preprocessing, MAR, reconstruction (`_astra_reconstruct` dispatches FBP/SIRT/CGLS; `_astra_fbp` is a thin wrapper), `reconstruct_slab` (image-domain slab averaging), HU calibration.
@@ -84,7 +93,10 @@ Folders (entry points `batch.sh` and `CLAUDE.md` stay at the root; `output/`, `l
 - **[image_subtraction_investigation.py](reconstruction/image_subtraction_investigation.py)** — standalone, **image-domain** subtraction study for image quality (label-free; reads the reconstructed HU volumes from `output/reconstruction/`, writes to `output/research/image_subtraction/`). Forms exclusive windows (A−B, …) as *image* differences. Concluded **negative** for image quality (cumulative bins share photons → correlated noise; see plan §4a and [docs/BIN_SEPARATION_FINDINGS.md](docs/BIN_SEPARATION_FINDINGS.md)); kept for the later material-decomposition work.
 - **[sinogram_subtraction_investigation.py](reconstruction/sinogram_subtraction_investigation.py)** — standalone, **sinogram-domain** subtraction study (needs raw `.mat` + CUDA). Forms exclusive-window sinograms (A−B, B−C, C−D, D) *before* reconstruction and (1) measures whether the A≥B≥C≥D ordering violation is zero-mean noise or a systematic gain bias (the empirical test of invariant #3 — the discriminator is the projection-averaged exclusive value per detector element), and (2) compares subtract-then-SIRT vs SIRT-then-subtract (they differ only because SIRT is nonlinear). **Does not modify invariant #3 or the production pipeline.** Writes to `output/research/sinogram_subtraction/`.
 - **[processed_separation_investigation.py](reconstruction/processed_separation_investigation.py)** — standalone diagnostic: is the Siemens-processed data **cumulative** (nested A⊇B⊇C⊇D) or **already exclusive**? Keys on the gain-invariant inter-threshold **noise correlation** (shared photons → correlated noise → cumulative; independent noise → exclusive), immune to the per-threshold gain that breaks the magnitude ordering (invariant #3). CPU-only (reads the HU volumes); writes to `output/research/processed_separation/`. Settles whether subtraction is even the right operation.
+- **[image_quality_metrics.py](reconstruction/image_quality_metrics.py)** — pure metrics library (no I/O, no `__main__`): NPS, circular-edge TTF, NEQ, detectability index `d'`, automatic body/insert/background ROI detection, insert-slab detection, slice-thickness matching. Validated against analytic answers by **[selftest_image_quality.py](reconstruction/selftest_image_quality.py)** (`python -m reconstruction.selftest_image_quality` — no data, no GPU). **Fixed conventions** (documented in the module docstring) that must not drift or numbers stop being comparable: NPS in HU²mm² normalised so ∫∫NPS = variance, DC excluded, detrending attenuation divided back out; TTF normalised to 1 at DC. `noise_power_spectrum(..., patch_px=)` **must** be given the same `patch_px` used for `background_patches` — a mismatch reads blocks that overrun the validated region and inflates noise several-fold (it now raises).
+- **[recon_comparison.py](reconstruction/recon_comparison.py)** — standalone investigation: our reconstruction vs Siemens WFBP vs Siemens VMI at the **reconstruction** stage (material maps are a separate, later study). Three resumable stages — `--stage 0` probe the Siemens DICOM geometry + auto-locate the insert slab (CPU), `--stage 1` sweep 5 reconstruction settings over that slab (GPU), `--stage 2` metrics + figures (CPU). Matches the vendor's slice thickness (by **averaging** native slices, never a √N rescale — SSR slices are z-correlated) and pixel grid; the kernel/QIR cannot be matched, which is why the headline output is a **noise-vs-resolution trade-off curve per threshold** rather than a single number. `--list-series DIR` dumps every DICOM series with its geometry — use it to find the right per-set folder, since several WFBP sets under one parent would otherwise be concatenated into one oversized channel stack. Writes to `output/research/recon_comparison/`; **never touches `output/reconstruction/`**. See [docs/RECON_COMPARISON_PLAN.md](docs/RECON_COMPARISON_PLAN.md).
 - **[IMAGE_QUALITY_PLAN.md](docs/IMAGE_QUALITY_PLAN.md)** — the design/roadmap doc behind the current revision. Explains *why* the noise/HU-separation knobs exist (WS1: `PREVIEW_SLAB_MM`, FAST-mode HU calibration, `SPIKE_MAD_K`/`IPR_MAD_K`; WS2: `RECON_METHOD`/`N_ITER` iterative recon) and records the project's non-breaking guarantees. **Deferred (out of scope, §4):** spectral-guided denoising (use high-SNR threshold A to guide the others), TV-regularized iterative, exclusive energy-bin images (A−B, B−C, C−D), and the material-decomposition stage itself. Read it before proposing image-quality changes so you don't re-litigate decided trade-offs or pull deferred work forward.
+- **[RECON_COMPARISON_PLAN.md](docs/RECON_COMPARISON_PLAN.md)** — design doc for the reconstruction comparison. Records *why* the metrics are what they are: why a plain RMSE against WFBP is rejected (for unbiased estimates it tends to √(σ₁²+σ₂²) — it measures independent noise, not error), why VMI is excluded from the paired analysis (HU-scale mismatch, **not** ranking), why thresholds are never mixed on one trade-off plot (bin photon statistics would swamp the reconstruction differences), and the three metric defects the self-test caught. Read it before changing the metric set.
 - **[SOFTWARE_ROADMAP.md](docs/SOFTWARE_ROADMAP.md)** — future goal of a publishable GUI app over reconstruction + decomposition; not started, but its design principles are binding for **new decomposition code now**: three clean layers (pure library → entry-point API → CLI/GUI drivers), config as a serializable dataclass (not module-level constants), stable `progress`/`cancel`-callback-ready entry points, no hardcoded paths, and extensibility via registries (materials = a CSV row, clinical modes = a registry entry) so the tool stays adaptable without editing core algorithms. The reconstruction driver's top-of-file-constants style is explicitly **not** to be copied into decomposition, and is left as-is (its own retrofit is parked until decomposition is finished).
 
 ### Data pipeline (per threshold)
@@ -107,15 +119,16 @@ sino_full : float32 [N_proj, n_rows, n_channels]  ≈ 16 GB
             apply_cor_shift(...)               # sub-pixel COR correction
             [apply_mar(...) if enabled]        # first-pass FBP → segment metal
                                                # → forward-project → inpaint+blend
-            _astra_fbp(...)                    # fan-beam FBP_CUDA, Ram-Lak
+            _astra_reconstruct(...)            # fan-beam FBP_CUDA / SIRT_CUDA /
+                                               # CGLS_CUDA per RECON_METHOD
                                                  ▼
                                           slice [n_pixels, n_pixels]
 ```
 
-### New pipeline steps (added in latest revision)
+### Non-obvious pipeline stages
 
-1. **Curved-detector remap** (`_remap_curved_to_flat` in `helical_reconstruction.py`) — inside `_astra_fbp` when `geometry_model='curved'` (default). Applies cosine pre-weight `cos(β_k)` then cubic interpolation from equiangular channel positions to equispaced flat-detector positions (`s = SDD·tan(β_k)`). Fixes radial position distortion and peripheral HU cupping. Only system A data (1376 channels, `beta_M4_A.txt`) — system B not available for researcher use.
-2. **Shepp-Logan filter default** — replaces Ram-Lak. Reduces noise ~30–60% without MTF impact at the center. Set `FILTER_NAME='ram-lak'` for geometry/MTF verification runs.
+1. **Curved-detector remap** (`_remap_curved_to_flat` in `helical_reconstruction.py`) — inside the FBP path when `geometry_model='curved'` (default). Applies cosine pre-weight `cos(β_k)` then cubic interpolation from equiangular channel positions to equispaced flat-detector positions (`s = SDD·tan(β_k)`). Fixes radial position distortion and peripheral HU cupping. Only system A data (1376 channels, `beta_M4_A.txt`) — system B not available for researcher use.
+2. **Smooth FBP filter instead of Ram-Lak** — `'shepp-logan'` (or the currently checked-in `'hann'`) reduces noise ~30–60% without MTF impact at the center. Set `FILTER_NAME='ram-lak'` for geometry/MTF verification runs only.
 3. **Adaptive wavelet stripe gating** — wavelet-FFT stripe removal (`remove_stripes_wavelet_fft`) now only runs when the sinogram's stripe-SNR proxy exceeds `WAVELET_RING_THRESHOLD`. Prevents it from washing out low-contrast inserts when no rings are present.
 4. **Helical projection weighting** (`z_weighting` in `rebin_helical_to_axial`, knob `Z_WEIGHTING`, default `'balanced'`) — controls how the rays of a rebinned rotation are weighted. The legacy **raised-cosine z-window** (`'hann'`, also `z_window=True`) tapers the projection axis to suppress 10–25 HU z-shading bands, but over a one-rotation window it doubles as an **angular apodization whose peak rides the helix** → a low-frequency brightness lobe that **rotates as you scroll z** (the "light cone"). `'balanced'` is **angularly-balanced helical weighting** (360°LI / complementary rebinning, Crawford & King 1990): it spans ~2 rotations, tapers each ray by `|z_offset|` (kills the z-shading) **and normalises every view angle to equal total weight** (kills the rotating bias). It is purely a sinogram-formation change — collapses to the same `(n_proj, n_ch)` contract and one ray per canonical view angle — so FBP/SIRT/CGLS all benefit identically and the recon code is untouched. `'none'` = uniform (no rotation, z-bands return). `check_angular_balance` (recon_invariants, soft) verifies the per-angle weight sum is 1. The wider window trims one rotation (not half) at each scan end — the driver passes `end_margin_rotations` to `z_targets_for_full_scan` accordingly.
 5. **Auto HU calibration** (`auto_hu_calibrate` / `apply_hu_calibration`) — Otsu body segmentation → 10 mm erosion → mode-based µ_water → median µ_air. Cached per-threshold to `output/reconstruction/calibration_thr_<label>.json`. Outputs both raw-attenuation and HU-scaled NIfTIs.
@@ -138,9 +151,18 @@ sino_full : float32 [N_proj, n_rows, n_channels]  ≈ 16 GB
 
 8. **The reconstruction view angle is the physical tube angle, not the projection index.** `build_geom` derives `geom['view_angle_per_proj']` from `ScanDescr.Det.FirstTubeAngle` (detector A, millidegrees) + a uniform `360/FramesPerRotation` increment, and `rebin_helical_to_axial` uses it. Assuming reading 0 = angle 0 (the old behaviour) ignores the ~151° start angle and rotates the whole image (e.g. the patient table appears on the side instead of the bottom). The fixed Siemens-gantry→ASTRA-fanflat convention is captured by two module constants `_VIEW_ANGLE_SIGN` / `_VIEW_ANGLE_OFFSET_DEG` (NOT scan data — same for every M4/system-A scan). `SystemAngle`/`TubeBOffsetAngle` (~95.7°) is the **dual-source A↔B mounting offset** and is deliberately unused (we reconstruct system A only). `check_orientation` (recon_invariants, soft) logs the measured table angle each run so `_VIEW_ANGLE_OFFSET_DEG` can be locked once and is then permanent — never per-scan, never an image rotate. **`FirstTubeAngle` is mandatory:** if `ScanDescr.Det.FirstTubeAngle` cannot be read, `build_geom` now raises rather than silently falling back to reading-0 = angle 0 (which produced a rotated volume), and `rebin_helical_to_axial` raises if `view_angle_per_proj` is missing. **`PatientPosition` is not in the raw descriptor** and is supplied via the driver's `PATIENT_POSITION` knob (default `'HFS'`). It does not affect the gantry-frame reconstruction (table always at the bottom) — only the array→patient (LPS) axis labelling (which side is Left/Right, Anterior/Posterior, Head/Foot). Only `'HFS'` is implemented/validated; other positions derive from it by a fixed flip table (FFS: flip L-R & head-foot; HFP: flip L-R & A-P; FFP: flip A-P & head-foot) and the knob errors out until each is added.
 
+### Thesis (LaTeX)
+
+`thesis/` holds the write-up as **fragments, not compilable documents** — each `.tex` starts straight at its own `\section{...}` / `\subsection{...}` with no preamble, `\documentclass`, or `\begin{document}`, and is meant to be `\input`-ed in filename order by an outer main file that lives outside this repo. Do not add a preamble to a fragment or try to compile one standalone. (`thesis/` is untracked so far — it is not gitignored, it has simply never been committed.)
+
+- `01_introduction.tex`, `02a_background.tex`, `02b_background.tex` — the chapters written so far. `02b` is a **continuation** of `02a`, not a new chapter: it opens at `\subsection{Spectral post-processing…}` under `02a`'s `\section{Background and State of the Art}`, so the two only make sense read (and `\input`-ed) in sequence. Prose style is continuous academic paragraphs (no bullet lists), British spelling, `\label`/`\ref` cross-references to `intro` / `sec:bg-*` / `methods`.
+- `references.bib` — the **merged** database that the document actually cites (~66 entries, sorted by key). `bib/refs_ct_recon.bib`, `refs_pcct.bib`, `refs_matdecomp.bib`, `refs_vmi_numerics.bib` are the per-topic source files it is merged from. Add a new entry to the appropriate topic file **and** keep `references.bib` in sync — they are not auto-generated from each other.
+
+The thesis text is the authoritative statement of *why* the pipeline is built this way (four thresholds at 20/40/56/75 keV, channel count discovered from data, conditioning analysis before solving, QRM phantom validation). Keep claims in it consistent with the code, and vice versa.
+
 ### Geometry text files
 
-Six text files live in [geometry/](geometry/) (alongside the `Geo_P63.pdf` datasheet), named by collimation mode and detector half:
+Six text files live in [geometry/](geometry/) (alongside the `Geo_P63.pdf` datasheet), named by collimation mode and detector half. **The whole folder is gitignored**, so these are required inputs that no clone or checkout will bring with it — if `build_geom` cannot find them, copy them in rather than assuming the file layout changed:
 
 - `beta_M4_A.txt`, `beta_M4_B.txt` — channel fan angles (radians) for M4 mode, halves A and B.
 - `beta_S1_A.txt`, `beta_S1_B.txt` — same for S1 mode.

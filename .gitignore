@@ -1,6 +1,7 @@
 logs/
 output/
 output_old/
+thesis/
 __pycache__/
 *.pyc
 geometry/
