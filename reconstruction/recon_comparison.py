@@ -200,23 +200,45 @@ def _mpl():
 # ═════════════════════════════════════════════════════════════════════
 # Stage 0 -- probe the Siemens export
 # ═════════════════════════════════════════════════════════════════════
+def _classify_text(text, loose=False):
+    """
+    Classify one string as a monoenergetic or threshold series.
+
+    Real NAEOTOM SeriesDescriptions look like
+        'MonoEnergeticPlus 70 keV'
+        'ProtocolModel WFBP_T1 Qr40f(3) 0.4 (0.4) [A,1]_0'
+    so the keV number is NOT adjacent to the word 'Mono' -- the product name sits in
+    between.  Match 'mono' and the keV figure independently rather than assuming they
+    are neighbours.  'VNC' and other spectral products match neither and are ignored.
+    """
+    if re.search(r"mono", text, re.IGNORECASE):
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*ke?V", text, re.IGNORECASE)
+        if m:
+            return ("mono", float(m.group(1)))
+    m = re.search(r"WFBP[_ ]*T([0-9]+)", text, re.IGNORECASE)
+    if m:
+        return ("threshold", int(m.group(1)))
+    if loose:
+        m = re.search(r"[_ /\\]T([0-9]+)[_ ]", text)
+        if m:
+            return ("threshold", int(m.group(1)))
+    return None
+
+
 def _classify_series(desc, path):
     """
     Series -> ('mono', keV) | ('threshold', n) | None.
 
-    Deliberately the same patterns as decomposition/material_decomposition.py so the
-    two stages agree on what a 'WFBP T2' or a 'Mono 70 keV' series is.  Kept local
-    rather than imported to avoid a reconstruction -> decomposition package dependency.
+    The SeriesDescription is tried ALONE first, and only then description+path.  A
+    Siemens export puts several products in one folder -- the VMI export here also
+    carries WFBP_T1/T2 series -- so a folder name containing 'Mono' must never be
+    allowed to re-label a series whose own description says WFBP.
+
+    Kept in step with decomposition/material_decomposition.py, but local, to avoid a
+    reconstruction -> decomposition package dependency.
     """
-    text = f"{desc or ''} {path or ''}"
-    m = re.search(r"Mono[_ ]*([0-9]+(?:\.[0-9]+)?)\s*keV", text, re.IGNORECASE)
-    if m:
-        return ("mono", float(m.group(1)))
-    m = (re.search(r"WFBP[_ ]*T([0-9]+)", text, re.IGNORECASE)
-         or re.search(r"[_ /\\]T([0-9]+)[_ ]", text))
-    if m:
-        return ("threshold", int(m.group(1)))
-    return None
+    return (_classify_text(desc or "")
+            or _classify_text(f"{desc or ''} {path or ''}", loose=True))
 
 
 def _is_dicom(path):
@@ -228,16 +250,34 @@ def _is_dicom(path):
         return False
 
 
-def index_dicom_series(folder):
+def index_dicom_series(folder, cache_dir=None):
     """
     Index DICOM series under `folder`, keeping the acquisition metadata the comparison
     needs.  SliceThickness and PixelSpacing are what make the comparison fair, and
-    ConvolutionKernel records what we are comparing against -- all three are standard
-    tags, present even though the QIR strength is not exposed.
+    ConvolutionKernel records what we are comparing against.
+
+    Reading 20-30 k headers takes minutes, and stages 0 and 2 both need the index, so
+    the result is cached per folder under cache_dir and reused.  Delete the cache file
+    (or pass --force) if the export itself changes.
 
     Returns {uid: {number, desc, kernel, thickness_mm, spacing_between_mm, pixel_mm,
                    rows, cols, recon_diameter_mm, files: [[z, path], ...]}}
     """
+    cache = None
+    if cache_dir:
+        import hashlib
+        h = hashlib.sha1(str(folder).encode("utf-8")).hexdigest()[:12]
+        cache = Path(cache_dir) / f"dicom_index_{h}.json"
+        if cache.exists():
+            try:
+                blob = json.loads(cache.read_text(encoding="utf-8"))
+                if blob.get("folder") == str(folder):
+                    logger.info("using cached DICOM index (%d series) %s",
+                                len(blob["series"]), cache.name)
+                    return blob["series"]
+            except (OSError, ValueError, KeyError):
+                pass
+
     sitk = _sitk()
     series = {}
     n_seen = 0
@@ -294,6 +334,14 @@ def index_dicom_series(folder):
             dz = dz[np.abs(dz) > 1e-6]
             s["spacing_between_mm"] = float(np.median(np.abs(dz))) if dz.size else None
     logger.info("indexed %d series / %d files under %s", len(series), n_seen, folder)
+    if cache is not None:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"folder": str(folder), "series": series}),
+                             encoding="utf-8")
+            logger.info("cached index -> %s", cache.name)
+        except OSError:
+            pass
     return series
 
 
@@ -344,7 +392,7 @@ def stage0_probe(cfg: CompareConfig):
     for kind, folder in (("wfbp", cfg.wfbp_dir), ("vmi", cfg.vmi_dir)):
         if not folder:
             continue
-        idx = index_dicom_series(folder)
+        idx = index_dicom_series(folder, cache_dir=out)
         chans = select_family(idx, kind)
         if not chans:
             disc = [(s.get("number"), s.get("desc")) for s in idx.values()]
@@ -734,7 +782,7 @@ def stage2_metrics(cfg: CompareConfig):
     for kind, folder in (("wfbp", match.get("wfbp_dir")), ("vmi", match.get("vmi_dir"))):
         if not folder or kind not in match["families"]:
             continue
-        chans = select_family(index_dicom_series(folder), kind)
+        chans = select_family(index_dicom_series(folder, cache_dir=out), kind)
         ctx = None
         for c in chans:
             vol, img, _z = read_series_volume(c, z_range=zr)
@@ -1018,8 +1066,8 @@ def build_parser():
     return p
 
 
-def _list_series(folder):
-    idx = index_dicom_series(folder)
+def _list_series(folder, cache_dir=None):
+    idx = index_dicom_series(folder, cache_dir=cache_dir)
     print(f"\n{len(idx)} series under {folder}\n")
     print(f"{'#':>5s} {'files':>6s} {'thick':>7s} {'space':>7s} {'pixel':>7s} "
           f"{'matrix':>10s} {'kernel':<12s} {'class':<12s} description")
@@ -1041,7 +1089,8 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
     if a.list_series:
-        _list_series(a.list_series)
+        Path(a.out_root).mkdir(parents=True, exist_ok=True)
+        _list_series(a.list_series, cache_dir=a.out_root)
         return 0
 
     cfg = CompareConfig(

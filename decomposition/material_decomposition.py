@@ -927,16 +927,43 @@ def load_own_energy_stack(config: DecompConfig):
     return vols, channels, ref
 
 
-def _classify_series(desc: str, path: str):
-    """Series -> ('mono', keV) | ('threshold', n) | None, parsed from description or folder name."""
-    text = f"{desc or ''} {path or ''}"
-    m = re.search(r"Mono[_ ]*([0-9]+(?:\.[0-9]+)?)\s*keV", text, re.IGNORECASE)
-    if m:
-        return ("mono", float(m.group(1)))
-    m = re.search(r"WFBP[_ ]*T([0-9]+)", text, re.IGNORECASE) or re.search(r"[_ /\\]T([0-9]+)[_ ]", text)
+def _classify_text(text: str, loose: bool = False):
+    """
+    Classify one string as a monoenergetic or threshold series.
+
+    Real NAEOTOM SeriesDescriptions are 'MonoEnergeticPlus 70 keV' and
+    'ProtocolModel WFBP_T1 Qr40f(3) 0.4 (0.4) [A,1]_0', so the keV figure is NOT
+    adjacent to the word 'Mono' -- the product name sits between them.  Match 'mono'
+    and the keV number independently instead of assuming they are neighbours.
+    'VNC' and other spectral products match neither and are ignored.
+    """
+    if re.search(r"mono", text, re.IGNORECASE):
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*ke?V", text, re.IGNORECASE)
+        if m:
+            return ("mono", float(m.group(1)))
+    m = re.search(r"WFBP[_ ]*T([0-9]+)", text, re.IGNORECASE)
     if m:
         return ("threshold", int(m.group(1)))
+    if loose:
+        m = re.search(r"[_ /\\]T([0-9]+)[_ ]", text)
+        if m:
+            return ("threshold", int(m.group(1)))
     return None
+
+
+def _classify_series(desc: str, path: str):
+    """
+    Series -> ('mono', keV) | ('threshold', n) | None.
+
+    The SeriesDescription is tried ALONE first, then description+folder name.  One
+    Siemens export folder holds several products -- the VMI export also carries
+    WFBP_T1/T2 series -- so a folder whose name contains 'Mono' must never re-label a
+    series whose own description says WFBP.
+
+    Kept in step with reconstruction/recon_comparison.py.
+    """
+    return (_classify_text(desc or "")
+            or _classify_text(f"{desc or ''} {path or ''}", loose=True))
 
 
 def _read_series_volume(sitk, files, z_slab_mm):
