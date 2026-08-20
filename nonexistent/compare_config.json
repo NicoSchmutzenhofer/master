@@ -1,0 +1,61 @@
+{
+  "out_root": "nonexistent",
+  "wfbp_dir": null,
+  "vmi_dir": null,
+  "data_path": "/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/full_sinogram_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.K\u00f6rper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat",
+  "desc_path": "/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/descriptor_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.K\u00f6rper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat",
+  "geo_dir": "C:\\Users\\nicom\\Documents\\Arbeit\\Claude\\Master\\geometry",
+  "n_pixels": null,
+  "fov_mm": null,
+  "slice_thickness_mm": null,
+  "slice_spacing_mm": null,
+  "slab_mm": null,
+  "slab_pad_mm": 2.0,
+  "max_slab_mm": 40.0,
+  "phantom_z_mm": [
+    -1515.5,
+    -1408.3
+  ],
+  "use_phantom_z": true,
+  "slab_select": "peak",
+  "expect_inserts": 18,
+  "geometry_model": "curved",
+  "z_weighting": "balanced",
+  "wavelet_ring_threshold": 2.0,
+  "spike_mad_k": 5.0,
+  "ipr_mad_k": 6.0,
+  "patient_position": "HFS",
+  "variants": [
+    {
+      "name": "fbp_ramlak",
+      "algorithm": "fbp",
+      "filter_name": "ram-lak"
+    },
+    {
+      "name": "fbp_shepplogan",
+      "algorithm": "fbp",
+      "filter_name": "shepp-logan"
+    },
+    {
+      "name": "fbp_hann",
+      "algorithm": "fbp",
+      "filter_name": "hann"
+    },
+    {
+      "name": "sirt_25",
+      "algorithm": "sirt",
+      "n_iter": 25
+    },
+    {
+      "name": "sirt_100",
+      "algorithm": "sirt",
+      "n_iter": 100
+    }
+  ],
+  "nps_patch_px": 64,
+  "insert_mad_k": 4.0,
+  "task_diameter_mm": 5.0,
+  "task_contrast_hu": 50.0,
+  "bias_smooth_mm": 5.0,
+  "force": false
+}

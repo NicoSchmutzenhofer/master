@@ -167,6 +167,35 @@ def background_patches(body_mask, inserts, pixel_mm, patch_px=64,
     return out
 
 
+def auto_background_patches(body_mask, inserts, pixel_mm, patch_px=64, min_patches=8,
+                            min_patch_px=16, **kw):
+    """
+    background_patches() with automatic size reduction.
+
+    The usable patch size is set by the phantom's geometry, not by preference: a vendor
+    export reconstructed at a whole-body FOV puts a ~200 mm phantom on ~1 mm pixels, so
+    a 64 px patch is 62 mm wide and no such square of clear background exists between
+    the inserts.  Halve until enough patches fit rather than failing.
+
+    Returns (patches, patch_px_used, tried) where `tried` is [(size, count), ...] for
+    diagnostics.  Use the SAME patch_px_used for every image being compared -- the NPS
+    frequency grid depends on it.
+    """
+    p = int(patch_px)
+    tried = []
+    while p >= int(min_patch_px):
+        pts = background_patches(body_mask, inserts, pixel_mm, patch_px=p, **kw)
+        tried.append((p, len(pts)))
+        if len(pts) >= int(min_patches):
+            return pts, p, tried
+        p //= 2
+    best = max(tried, key=lambda t: t[1]) if tried else (int(patch_px), 0)
+    if best[1] > 0:
+        return (background_patches(body_mask, inserts, pixel_mm, patch_px=best[0], **kw),
+                best[0], tried)
+    return [], int(patch_px), tried
+
+
 # ═════════════════════════════════════════════════════════════════════
 # Noise power spectrum
 # ═════════════════════════════════════════════════════════════════════
@@ -589,32 +618,57 @@ def roi_statistics(volume, inserts, body_mask, pixel_mm, shrink=0.7):
 # ═════════════════════════════════════════════════════════════════════
 # Slab / structure detection
 # ═════════════════════════════════════════════════════════════════════
-def find_insert_slab(volume, pixel_mm, z_positions_mm, air_hu=-300.0, smooth_mm=1.0):
+def find_insert_slab(volume, pixel_mm, z_positions_mm, air_hu=-300.0, smooth_mm=1.0,
+                     search_z_mm=None, min_run=3, select="peak"):
     """
-    Locate the z-range containing the phantom's insert layer.
+    Locate the z-range containing a phantom insert layer.
 
-    The insert layer is the run of slices with strong in-plane structure inside the
-    body; homogeneous layers have none.
+    The insert layer is a run of slices with strong in-plane structure inside the body;
+    homogeneous layers have none.  Structure is scored as the FRACTION of body voxels
+    lying far from the body median, after light smoothing so that quantum noise -- the
+    very thing that differs between the channels -- does not drive the detection.  A
+    spread statistic such as the MAD does not work here: inserts occupy only a few
+    percent of the body area, and MAD is designed precisely to discard a small minority
+    of deviant voxels, so it stays flat straight through the insert layer.
 
-    Structure is scored as the FRACTION of body voxels lying far from the body median,
-    measured after light smoothing so that quantum noise -- the very thing that differs
-    between the channels -- does not drive the detection.  A spread statistic such as
-    the MAD does not work here: inserts occupy only a few percent of the body area, and
-    MAD is designed precisely to ignore a small minority of deviant voxels, so it stays
-    flat through the insert layer.  Counting the outliers instead makes the layer stand
-    out by orders of magnitude.
+    search_z_mm : (lo, hi) restricting where a slab may be chosen.  **Supply this for a
+        long clinical scan range.**  A Thx-Abdomen acquisition contains the table, the
+        positioning aids and scan-end artefacts, any of which can out-score the phantom
+        and put the slab hundreds of millimetres away from it.  Slices outside the range
+        are not even scored, which is also much faster.
 
-    Returns dict: z_lo_mm, z_hi_mm, k_lo, k_hi, score (per-slice structure curve).
+    select : 'peak'    -- the run containing the single most insert-covered slice.
+                          Best when layers differ in how many inserts they carry, since
+                          the score is essentially the insert area fraction.
+             'longest' -- the longest run above threshold (the previous behaviour).
+
+    Returns dict with the chosen k_lo/k_hi/z_lo_mm/z_hi_mm, the full per-slice `score`,
+    and **`candidates`**: every run found, so a layer that was not selected is still
+    visible in the log and the QC figure rather than being silently discarded.
     """
     vol = np.asarray(volume, dtype=np.float32)
     nz = vol.shape[0]
+    z = np.asarray(z_positions_mm, dtype=float)
     score = np.zeros(nz)
+
+    if search_z_mm is not None:
+        lo, hi = sorted(float(v) for v in search_z_mm)
+        in_range = (z >= lo) & (z <= hi)
+        if not in_range.any():
+            raise ValueError(
+                f"find_insert_slab: search range {lo:.1f}..{hi:.1f} mm contains no "
+                f"slices (volume spans {z.min():.1f}..{z.max():.1f} mm)")
+    else:
+        in_range = np.ones(nz, dtype=bool)
+
     sigma_px = max(0.5, smooth_mm / pixel_mm)
     # The body edge must be eroded away before scoring: smoothing drags the -1000 HU
     # air across the boundary, producing a rim of extreme values in EVERY slice, which
     # would otherwise score as "structure" and flatten the curve completely.
     erode_px = int(np.ceil(3 * sigma_px))
     for k in range(nz):
+        if not in_range[k]:
+            continue
         sl = vol[k]
         body = sl > air_hu
         if body.sum() < 100:
@@ -631,26 +685,43 @@ def find_insert_slab(volume, pixel_mm, z_positions_mm, air_hu=-300.0, smooth_mm=
         score[k] = float(np.mean(np.abs(v - med) > 5.0 * mad))
 
     if not np.any(score > 0):
-        raise ValueError("find_insert_slab: no structure found in any slice")
+        raise ValueError("find_insert_slab: no structure found in the searched range")
+
     # Bridge single-slice dropouts before thresholding at a fraction of the peak.
     score_s = ndimage.median_filter(score, size=3, mode="nearest")
-    above = score_s >= 0.25 * score_s.max()
+    score_s[~in_range] = 0.0
     thr = 0.25 * float(score_s.max())
-    # longest contiguous run above threshold
-    best, cur, best_len = (0, 0), None, 0
-    for k in range(nz):
-        if above[k]:
-            cur = k if cur is None else cur
-            if k - cur + 1 > best_len:
-                best_len, best = k - cur + 1, (cur, k)
-        else:
+    above = score_s >= thr
+
+    runs = []
+    cur = None
+    for k in range(nz + 1):
+        hot = bool(above[k]) if k < nz else False
+        if hot and cur is None:
+            cur = k
+        elif not hot and cur is not None:
+            a, b = cur, k - 1
+            if b - a + 1 >= int(min_run):
+                runs.append({
+                    "k_lo": int(a), "k_hi": int(b), "n_slices": int(b - a + 1),
+                    "z_lo_mm": float(min(z[a], z[b])), "z_hi_mm": float(max(z[a], z[b])),
+                    "peak_score": float(score_s[a:b + 1].max()),
+                    "mean_score": float(score_s[a:b + 1].mean()),
+                })
             cur = None
-    k_lo, k_hi = best
-    z = np.asarray(z_positions_mm, dtype=float)
-    return {"k_lo": int(k_lo), "k_hi": int(k_hi),
-            "z_lo_mm": float(min(z[k_lo], z[k_hi])),
-            "z_hi_mm": float(max(z[k_lo], z[k_hi])),
-            "score": score, "threshold": float(thr)}
+    if not runs:                       # nothing survived min_run -- fall back to the peak
+        k = int(np.argmax(score_s))
+        runs = [{"k_lo": k, "k_hi": k, "n_slices": 1,
+                 "z_lo_mm": float(z[k]), "z_hi_mm": float(z[k]),
+                 "peak_score": float(score_s[k]), "mean_score": float(score_s[k])}]
+
+    key = (lambda r: r["n_slices"]) if select == "longest" else (lambda r: r["peak_score"])
+    best = max(runs, key=key)
+    return {"k_lo": best["k_lo"], "k_hi": best["k_hi"],
+            "z_lo_mm": best["z_lo_mm"], "z_hi_mm": best["z_hi_mm"],
+            "score": score, "threshold": float(thr),
+            "candidates": sorted(runs, key=key, reverse=True),
+            "select": select}
 
 
 def match_slice_thickness(vol_native, z_native_mm, target_thickness_mm, target_z_mm):

@@ -19,7 +19,8 @@
 #   sbatch batch_compare.sh                       # all stages, paths from below
 #   sbatch batch_compare.sh --stage 2             # metrics only (CPU, seconds)
 #   sbatch batch_compare.sh --force               # redo the sweep from scratch
-#   sbatch batch_compare.sh --slab 12,44          # override the detected slab
+#   sbatch batch_compare.sh --slab=-1500,-1470    # override the detected slab
+#                                                 (use = for negative values)
 #
 # Any extra argument is passed straight through to recon_comparison.py, so
 # `--help` there is the authoritative list.
@@ -34,12 +35,29 @@
 # ============================================================================
 
 # --- the three input paths (edit these) -------------------------------------
-WFBP_DIR="/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/WFBP"
-VMI_DIR="/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/Mono"
+WFBP_DIR="/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/Thx.- Abdomen Staging_Standard - PNR_20260729_124048/"
+VMI_DIR="/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/Thx.- Abdomen Staging_Standard - PNR_20260729_092611/"
 DATA_PATH="/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/full_sinogram_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.Körper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat"
 DESC_PATH="/data/Data2/4_BIN_PCCT/4 bin Phantom raw data/Descriptor/descriptor_4-bin_Phantom-Scan..CT.Thx.-_Abdomen_Staging.Körper.601.RAW.20260326.074506.20260401.175846.e00e8253-e854-4963-bed1-1ac627e653d7.raw.mat"
 
 OUT_ROOT="output/research/recon_comparison"
+
+# --- phantom extent, read off the WFBP volume in Slicer ---------------------
+# Without this the insert-layer search covers the whole Thx-Abdomen range, where the
+# table / positioning aids / scan-end artefacts can out-score the phantom -- the first
+# run picked a slab at z ~ -2125 mm, roughly 665 mm away from the phantom.
+# Set PHANTOM_Z="" (or pass --no-phantom-z) to search the whole range again.
+PHANTOM_Z="-1515.5,-1408.3"
+EXPECT_INSERTS=18
+
+PHANTOM_ARGS=""
+if [ -n "$PHANTOM_Z" ]; then
+    # NOTE the = form: a value starting with "-" is otherwise taken as a flag
+    PHANTOM_ARGS="--phantom-z=$PHANTOM_Z"
+fi
+if [ -n "$EXPECT_INSERTS" ]; then
+    PHANTOM_ARGS="$PHANTOM_ARGS --expect-inserts=$EXPECT_INSERTS"
+fi
 
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate /home/nisc24/.conda/envs/MatDecomp
@@ -58,6 +76,7 @@ python -m reconstruction.recon_comparison --stage 0 \
     --wfbp-dir "$WFBP_DIR" \
     --vmi-dir  "$VMI_DIR" \
     --out-root "$OUT_ROOT" \
+    $PHANTOM_ARGS \
     "$@"
 
 echo
@@ -73,6 +92,7 @@ echo
 echo "=== 3/3  metrics: NPS / TTF / NEQ / d' / bias (CPU) ==="
 python -m reconstruction.recon_comparison --stage 2 \
     --out-root "$OUT_ROOT" \
+    $PHANTOM_ARGS \
     "$@"
 
 echo

@@ -124,6 +124,14 @@ class CompareConfig:
     slab_mm: Optional[tuple] = None
     slab_pad_mm: float = 2.0
     max_slab_mm: float = 40.0
+    # Axial extent of the phantom itself, read off the vendor volume (e.g. in Slicer).
+    # Strongly recommended for a clinical scan range: without it the search covers the
+    # whole acquisition, where the table or a scan-end artefact can out-score the
+    # phantom and place the slab hundreds of mm away from it.
+    phantom_z_mm: Optional[tuple] = None
+    use_phantom_z: bool = True      # False ignores a configured phantom_z_mm
+    slab_select: str = "peak"       # "peak" (most insert-covered) | "longest"
+    expect_inserts: Optional[int] = None   # warn if the detected count differs
 
     # Reconstruction settings held fixed across the sweep (only the swept knobs vary).
     geometry_model: str = "curved"
@@ -136,7 +144,8 @@ class CompareConfig:
     variants: list = field(default_factory=lambda: [dict(v) for v in DEFAULT_VARIANTS])
 
     # Metric parameters
-    nps_patch_px: int = 64
+    nps_patch_px: int = 64          # requested; reduced automatically if it does not fit
+    insert_mad_k: float = 4.0       # lower = detect fainter inserts (more false positives)
     task_diameter_mm: float = 5.0
     task_contrast_hu: float = 50.0
     bias_smooth_mm: float = 5.0
@@ -420,8 +429,34 @@ def stage0_probe(cfg: CompareConfig):
                     spacing, thickness)
 
     # Locate the insert layer on the reference volume (CPU, no GPU needed).
-    vol, img, zpos = read_series_volume(ref)
-    slab = iq.find_insert_slab(vol, pixel_mm, zpos)
+    # Reading is limited to the phantom when known: a Thx-Abdomen series is thousands of
+    # slices, and the whole point of the restriction is that the rest of the scan range
+    # (table, positioning aids, scan-end artefacts) can out-score the phantom entirely.
+    phantom_z = cfg.phantom_z_mm if cfg.use_phantom_z else None
+    if phantom_z:
+        pad = max(cfg.slab_pad_mm, 5.0)
+        read_range = (min(phantom_z) - pad, max(phantom_z) + pad)
+        logger.info("restricting to the phantom: z = %.2f .. %.2f mm", *sorted(phantom_z))
+    else:
+        read_range = None
+        logger.info("no --phantom-z given: searching the WHOLE scan range for the insert "
+                    "layer. On a long clinical range the table or a scan-end artefact can "
+                    "out-score the phantom -- check the QC figure carefully.")
+    vol, img, zpos = read_series_volume(ref, z_range=read_range)
+    logger.info("reference volume: %d slices, z = %.1f .. %.1f mm",
+                vol.shape[0], zpos.min(), zpos.max())
+
+    slab = iq.find_insert_slab(vol, pixel_mm, zpos, search_z_mm=phantom_z,
+                               select=cfg.slab_select)
+    logger.info("candidate insert layers (ranked by %s):", cfg.slab_select)
+    for i, c in enumerate(slab["candidates"][:8]):
+        mark = " <- selected" if (c["k_lo"], c["k_hi"]) == (slab["k_lo"], slab["k_hi"]) else ""
+        logger.info("   %d. z = %+9.2f .. %+9.2f mm  %3d slices  peak %.4f  mean %.4f%s",
+                    i + 1, c["z_lo_mm"], c["z_hi_mm"], c["n_slices"],
+                    c["peak_score"], c["mean_score"], mark)
+    if len(slab["candidates"]) > 1:
+        logger.info("   (pass --slab z_lo,z_hi to force a different layer)")
+
     z_lo = slab["z_lo_mm"] - cfg.slab_pad_mm
     z_hi = slab["z_hi_mm"] + cfg.slab_pad_mm
     if cfg.slab_mm is not None:
@@ -431,11 +466,14 @@ def stage0_probe(cfg: CompareConfig):
         mid = 0.5 * (z_lo + z_hi)
         z_lo, z_hi = mid - cfg.max_slab_mm / 2, mid + cfg.max_slab_mm / 2
         logger.info("slab trimmed to %.1f mm about its centre", cfg.max_slab_mm)
+    if phantom_z:                       # never let padding leave the phantom
+        z_lo = max(z_lo, min(phantom_z))
+        z_hi = min(z_hi, max(phantom_z))
     logger.info("insert slab: z = %.2f .. %.2f mm (%d slices in the vendor volume)",
                 z_lo, z_hi, int(np.sum((zpos >= z_lo) & (zpos <= z_hi))))
 
     _qc_slab_figure(out / "qc" / "stage0_slab_detection.png", vol, zpos, slab, z_lo, z_hi,
-                    pixel_mm, ref_kind, ref["label"])
+                    pixel_mm, ref_kind, ref["label"], phantom_z)
 
     match = {
         "reference_family": ref_kind,
@@ -464,17 +502,28 @@ def stage0_probe(cfg: CompareConfig):
     return match
 
 
-def _qc_slab_figure(path, vol, zpos, slab, z_lo, z_hi, pixel_mm, kind, label):
+def _qc_slab_figure(path, vol, zpos, slab, z_lo, z_hi, pixel_mm, kind, label,
+                    phantom_z=None):
     plt = _mpl()
     if plt is None:
         return
     fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
     ax[0].plot(zpos, slab["score"], lw=1.2)
     ax[0].axhline(slab["threshold"], color="grey", ls=":", label="threshold")
-    ax[0].axvspan(z_lo, z_hi, color="tab:orange", alpha=0.25, label="selected slab")
+    # Every candidate layer is drawn, not just the winner: a phantom with several insert
+    # layers should show several bands, and seeing the ones that were NOT chosen is how
+    # you tell "picked the wrong layer" from "only found one".
+    for i, c in enumerate(slab.get("candidates", [])):
+        ax[0].axvspan(c["z_lo_mm"], c["z_hi_mm"], color="tab:blue", alpha=0.12,
+                      label="candidate layers" if i == 0 else None)
+    if phantom_z:
+        for zv in sorted(phantom_z):
+            ax[0].axvline(zv, color="tab:green", ls="--", lw=1.0)
+        ax[0].axvline(np.nan, color="tab:green", ls="--", lw=1.0, label="--phantom-z")
+    ax[0].axvspan(z_lo, z_hi, color="tab:orange", alpha=0.35, label="selected slab")
     ax[0].set_xlabel("z (mm)")
     ax[0].set_ylabel("fraction of body voxels far from median")
-    ax[0].set_title("insert-layer score")
+    ax[0].set_title(f"insert-layer score ({len(slab.get('candidates', []))} candidates)")
     ax[0].legend(fontsize=8)
 
     k_mid = int(np.clip((slab["k_lo"] + slab["k_hi"]) // 2, 0, vol.shape[0] - 1))
@@ -562,6 +611,13 @@ def stage1_sweep(cfg: CompareConfig):
     # Native slices spanning the slab, padded by half the target thickness so the
     # outermost matched slice still has a full averaging window.
     pad = 0.5 * match["slice_thickness_mm"] + abs(z_spacing)
+    # Report both frames: the slab comes from the vendor DICOM z (ImagePositionPatient)
+    # while we reconstruct in our own helical z.  They should share the scanner table
+    # coordinate, but that is an assumption -- printing both makes a mismatch obvious
+    # instead of it showing up later as a phantom that is missing from qc/roi_own.png.
+    logger.info("z frames: ours %.1f .. %.1f mm | requested slab (vendor frame) "
+                "%.1f .. %.1f mm", z_all.min(), z_all.max(),
+                match["z_lo_mm"], match["z_hi_mm"])
     sel = (z_all >= match["z_lo_mm"] - pad) & (z_all <= match["z_hi_mm"] + pad)
     z_native = z_all[sel]
     if z_native.size == 0:
@@ -641,7 +697,7 @@ def stage1_sweep(cfg: CompareConfig):
 # ═════════════════════════════════════════════════════════════════════
 # Stage 2 -- metrics
 # ═════════════════════════════════════════════════════════════════════
-def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches):
+def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patch_px):
     """
     Full metric set for one volume, given ROIs fixed by the family's reference.
 
@@ -652,7 +708,7 @@ def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches):
     cutting the noise that would otherwise corrupt the differentiated edge profile.
     """
     res = {}
-    nps = iq.noise_power_spectrum(vol, patches, pixel_mm, patch_px=cfg.nps_patch_px)
+    nps = iq.noise_power_spectrum(vol, patches, pixel_mm, patch_px=patch_px)
     res["noise_sd_hu"] = nps["noise_sd_hu"]
     res["f_av"] = nps["f_av"]
     res["f_peak"] = nps["f_peak"]
@@ -687,7 +743,7 @@ def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches):
     return res
 
 
-def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir):
+def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch_px=None):
     """
     Detect body/inserts/background patches ONCE per family, then reuse for every channel
     and variant of that family, so a metric difference can never come from the ROIs
@@ -702,19 +758,56 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir):
     """
     flat = vol_ref.mean(axis=0)
     body = iq.detect_body_mask(flat, pixel_mm)
-    inserts = iq.detect_inserts(flat, body, pixel_mm)
-    patches = iq.background_patches(body, inserts, pixel_mm, patch_px=cfg.nps_patch_px)
-    logger.info("  %s: %d inserts, %d NPS patches", tag, len(inserts), len(patches))
+    inserts = iq.detect_inserts(flat, body, pixel_mm,
+                                contrast_mad_k=cfg.insert_mad_k)
+
+    if force_patch_px:
+        # Every family must share one patch size: the NPS frequency grid depends on it,
+        # so curves measured at different sizes are not comparable.
+        patches = iq.background_patches(body, inserts, pixel_mm, patch_px=force_patch_px)
+        patch_px, tried = force_patch_px, [(force_patch_px, len(patches))]
+        if len(patches) < 8:
+            logger.warning("  %s: only %d patches at the family patch size %d px -- NPS "
+                           "statistics for this family will be thin", tag, len(patches),
+                           force_patch_px)
+    else:
+        patches, patch_px, tried = iq.auto_background_patches(
+            body, inserts, pixel_mm, patch_px=cfg.nps_patch_px)
+        if patch_px != cfg.nps_patch_px:
+            logger.info("  %s: %d px patches did not fit; using %d px (%.1f mm). Tried %s",
+                        tag, cfg.nps_patch_px, patch_px, patch_px * pixel_mm,
+                        ", ".join(f"{s}px->{n}" for s, n in tried))
+
+    body_px = int(body.sum())
+    logger.info("  %s: body %d px (%.0f mm2), %d inserts, %d NPS patches of %d px (%.1f mm)",
+                tag, body_px, body_px * pixel_mm ** 2, len(inserts), len(patches),
+                patch_px, patch_px * pixel_mm)
+    for i, ins in enumerate(inserts):
+        logger.info("      insert %d: r=%.1f mm  %+.0f HU vs background  circularity %.2f",
+                    i, ins["radius_mm"], ins["contrast_hu"], ins["circularity"])
     if not inserts:
-        logger.warning("  %s: no inserts detected -- TTF/NEQ/d' will be unavailable and "
-                       "background patches are not insert-excluded. Check qc/roi_%s.png",
-                       tag, tag)
+        logger.warning("  %s: no inserts detected -- TTF/NEQ/d' unavailable, and the "
+                       "background is not insert-excluded. Check qc/roi_%s.png", tag, tag)
+    elif cfg.expect_inserts and len(inserts) != cfg.expect_inserts:
+        logger.warning("  %s: found %d inserts but %d were expected. Undetected inserts "
+                       "stay INSIDE the background region and inflate the noise estimate, "
+                       "so this matters beyond TTF. Try a lower --insert-mad-k, or a "
+                       "different layer via --slab; check qc/roi_%s.png.",
+                       tag, len(inserts), cfg.expect_inserts, tag)
+
+    # Written BEFORE any failure: when detection goes wrong the overlay is the only way
+    # to see why, so it must exist even on the unhappy path.
+    _qc_roi_figure(qc_dir / f"roi_{tag}.png", flat, body, inserts, patches, patch_px, tag)
+
     if not patches:
-        raise ValueError(f"{tag}: no uniform background patches found -- try a smaller "
-                         f"--nps-patch-px than {cfg.nps_patch_px}")
-    _qc_roi_figure(qc_dir / f"roi_{tag}.png", flat, body, inserts, patches,
-                   cfg.nps_patch_px, tag)
-    return body, inserts, patches
+        raise ValueError(
+            f"{tag}: no uniform background patches fit. body={body_px} px "
+            f"({body_px * pixel_mm ** 2:.0f} mm2), {len(inserts)} inserts, pixel "
+            f"{pixel_mm:.4f} mm; tried "
+            f"{', '.join(f'{s}px({s * pixel_mm:.0f}mm)->{n}' for s, n in tried)}. "
+            f"Look at qc/roi_{tag}.png -- if the blue body outline is wrong the HU "
+            f"calibration is off; if it is right, pass a smaller --nps-patch-px.")
+    return body, inserts, patches, patch_px
 
 
 def _qc_roi_figure(path, img, body, inserts, patches, patch_px, tag):
@@ -756,6 +849,7 @@ def stage2_metrics(cfg: CompareConfig):
 
     # ---- own: every swept variant ------------------------------------
     own_ctx = None
+    shared_patch_px = None      # one patch size for ALL families (comparable NPS grids)
     for v in cfg.variants:
         vdir = out / "sweep" / v["name"]
         if not (vdir / "reconstruction_thr_A_HU.nii.gz").exists():
@@ -768,12 +862,13 @@ def stage2_metrics(cfg: CompareConfig):
                 continue
             vol = sitk.GetArrayFromImage(sitk.ReadImage(str(p))).astype(np.float32)
             pixel_mm = match["pixel_mm"]
-            if own_ctx is None:      # detect once on the first (highest-SNR) volume
+            if own_ctx is None:      # detect once, reuse for every variant/threshold
                 own_ctx = _family_rois(vol, pixel_mm, cfg, "own", qc)
-            body, inserts, patches = own_ctx
+                shared_patch_px = own_ctx[3]
+            body, inserts, patches, patch_px = own_ctx
             logger.info("own/%s thr %s", v["name"], label)
             results["own"][v["name"]][label] = _measure_volume(
-                vol, pixel_mm, inserts, cfg, body, patches)
+                vol, pixel_mm, inserts, cfg, body, patches, patch_px)
             del vol
             gc.collect()
 
@@ -788,11 +883,14 @@ def stage2_metrics(cfg: CompareConfig):
             vol, img, _z = read_series_volume(c, z_range=zr)
             pixel_mm = float(img.GetSpacing()[0])
             if ctx is None:
-                ctx = _family_rois(vol, pixel_mm, cfg, kind, qc)
-            body, inserts, patches = ctx
+                ctx = _family_rois(vol, pixel_mm, cfg, kind, qc,
+                                   force_patch_px=shared_patch_px)
+                if shared_patch_px is None:
+                    shared_patch_px = ctx[3]
+            body, inserts, patches, patch_px = ctx
             logger.info("%s %s", kind, c["label"])
             results[kind][c["label"]] = _measure_volume(vol, pixel_mm, inserts, cfg,
-                                                        body, patches)
+                                                        body, patches, patch_px)
             results[kind][c["label"]]["pixel_mm"] = pixel_mm
             results[kind][c["label"]]["kernel"] = c["kernel"]
             if kind == "wfbp":
@@ -819,7 +917,7 @@ def _bias_analysis(cfg, match, wfbp_vols, own_ctx):
     """Systematic (low-frequency) difference between our recon and WFBP, per threshold."""
     sitk = _sitk()
     out = Path(cfg.out_root)
-    body, inserts, _patches = own_ctx
+    body, inserts, _patches, _patch_px = own_ctx
     pixel_mm = match["pixel_mm"]
     bias = {}
     # T1..T4 are the vendor's names for the same cumulative thresholds as our A..D.
@@ -1048,12 +1146,33 @@ def build_parser():
     p.add_argument("--data-path", default=_DEFAULT_DATA, help="raw sinogram .mat (HDF5)")
     p.add_argument("--desc-path", default=_DEFAULT_DESC, help="descriptor .mat (v5 struct)")
     p.add_argument("--geo-dir", default=str(_REPO_ROOT / "geometry"))
-    p.add_argument("--slab", help="override the auto-detected slab, 'z_lo,z_hi' in mm")
+    p.add_argument("--slab",
+                   help="override the auto-detected slab, 'z_lo,z_hi' in mm. "
+                        "Write it as --slab=-1500,-1470 -- a value starting with "
+                        "'-' is otherwise parsed as a flag")
+    p.add_argument("--phantom-z", metavar="LO,HI",
+                   help="axial extent of the phantom in mm (read off the vendor volume, "
+                        "e.g. in Slicer). Restricts the insert-layer search to the "
+                        "phantom. Strongly recommended for a clinical scan range. "
+                        "Write it as --phantom-z=-1515.5,-1408.3 -- a value "
+                        "starting with '-' is otherwise parsed as a flag")
+    p.add_argument("--no-phantom-z", action="store_true",
+                   help="ignore --phantom-z and search the whole scan range")
+    p.add_argument("--slab-select", choices=["peak", "longest"], default="peak",
+                   help="which candidate layer to take: peak = most insert-covered "
+                        "slice (best when layers carry different insert counts)")
+    p.add_argument("--expect-inserts", type=int,
+                   help="expected number of inserts; warns when detection disagrees")
     p.add_argument("--max-slab-mm", type=float, default=40.0,
                    help="cap on the swept slab so the GPU stage stays affordable")
     p.add_argument("--n-pixels", type=int, help="override the matched matrix size")
     p.add_argument("--fov-mm", type=float, help="override the matched FOV")
-    p.add_argument("--nps-patch-px", type=int, default=64)
+    p.add_argument("--nps-patch-px", type=int, default=64,
+                   help="requested NPS patch size; halved automatically until it fits "
+                        "the phantom, and the chosen size is shared by all families")
+    p.add_argument("--insert-mad-k", type=float, default=4.0,
+                   help="insert-detection sensitivity in robust SDs; lower finds "
+                        "fainter inserts. Check qc/roi_*.png after changing it")
     p.add_argument("--task-diameter-mm", type=float, default=5.0)
     p.add_argument("--task-contrast-hu", type=float, default=50.0)
     p.add_argument("--variants", help="comma-separated subset of variant names to run")
@@ -1097,9 +1216,14 @@ def main(argv=None):
         out_root=a.out_root, wfbp_dir=a.wfbp_dir, vmi_dir=a.vmi_dir,
         data_path=a.data_path, desc_path=a.desc_path, geo_dir=a.geo_dir,
         n_pixels=a.n_pixels, fov_mm=a.fov_mm, max_slab_mm=a.max_slab_mm,
-        nps_patch_px=a.nps_patch_px, task_diameter_mm=a.task_diameter_mm,
+        nps_patch_px=a.nps_patch_px, insert_mad_k=a.insert_mad_k,
+        task_diameter_mm=a.task_diameter_mm,
         task_contrast_hu=a.task_contrast_hu, force=a.force,
         slab_mm=tuple(float(x) for x in a.slab.split(",")) if a.slab else None,
+        phantom_z_mm=(tuple(float(x) for x in a.phantom_z.split(","))
+                      if a.phantom_z else None),
+        use_phantom_z=not a.no_phantom_z,
+        slab_select=a.slab_select, expect_inserts=a.expect_inserts,
     )
     if a.variants:
         want = {s.strip() for s in a.variants.split(",")}

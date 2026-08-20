@@ -178,12 +178,72 @@ def test_slab_and_thickness(rng):
               abs(sd["k_lo"] - k0) <= 2 and abs(sd["k_hi"] - k1) <= 2,
               f"detected k=[{sd['k_lo']},{sd['k_hi']}], truth [{k0},{k1}]")
 
+    test_slab_search_restriction(rng)
+
     native = rng.normal(0, 30.0, (100, 32, 32)).astype(np.float32)
     z_nat = np.arange(100) * 0.4
     matched, used = iq.match_slice_thickness(native, z_nat, 2.0, np.arange(10, 30) * 0.4)
     _chk("thickness-matched noise = sd/sqrt(n)", float(matched.std()),
          30.0 / np.sqrt(np.mean(used)), 0.10)
     print(f"        averaged {np.mean(used):.1f} native slices per 2.0 mm slice")
+
+
+def test_slab_search_restriction(rng):
+    """
+    Regression test for a real failure: on a long clinical scan range an off-phantom
+    structure out-scored the phantom and put the slab ~665 mm away from it.
+
+    Also checks that with several insert layers, select='peak' takes the one carrying
+    the MOST inserts, including when that layer sits hard against the end of the
+    phantom (the layer most at risk of being missed).
+    """
+    print("\n[7] slab search restricted to the phantom")
+    pix = 500.0 / 512
+    n = 256
+    yy, xx = np.mgrid[:n, :n]
+    cy = cx = n / 2 - 0.5
+    body = ((yy - cy) ** 2 + (xx - cx) ** 2) <= (100 / pix) ** 2
+    z = np.arange(-2200, -1300, 4.0)
+    vol = np.empty((len(z), n, n), dtype=np.float32)
+
+    def ring(sl, count, r_ring, r_ins, hu):
+        for j in range(count):
+            a = 2 * np.pi * j / count
+            m = (((yy - (cy + r_ring * np.sin(a) / pix)) ** 2
+                  + (xx - (cx + r_ring * np.cos(a) / pix)) ** 2) <= (r_ins / pix) ** 2)
+            sl[m] = hu
+
+    phantom_z = (-1515.5, -1408.3)
+    for k, zz in enumerate(z):
+        sl = np.full((n, n), -1000.0, dtype=np.float32)
+        if phantom_z[0] <= zz <= phantom_z[1]:
+            sl[body] = 0.0
+            if -1500 <= zz <= -1470:
+                ring(sl, 10, 70, 7, 250.0)          # fewer inserts
+            if -1425 <= zz <= -1410:
+                ring(sl, 18, 70, 7, 250.0)          # most inserts, at the phantom end
+        if -2140 <= zz <= -2110:                    # off-phantom decoy
+            sl[body] = 0.0
+            ring(sl, 24, 60, 11, 900.0)
+        vol[k] = sl + rng.normal(0, 12.0, sl.shape)
+
+    unrestricted = iq.find_insert_slab(vol, pix, z, select="peak")
+    _chk_true("unrestricted search is captured by the decoy (the bug)",
+              unrestricted["z_lo_mm"] < -2000,
+              f"slab at {unrestricted['z_lo_mm']:+.0f}..{unrestricted['z_hi_mm']:+.0f} mm")
+
+    restricted = iq.find_insert_slab(vol, pix, z, search_z_mm=phantom_z, select="peak")
+    inside = (phantom_z[0] - 1 <= restricted["z_lo_mm"]
+              and restricted["z_hi_mm"] <= phantom_z[1] + 1)
+    _chk_true("search_z_mm confines the slab to the phantom", inside,
+              f"slab at {restricted['z_lo_mm']:+.0f}..{restricted['z_hi_mm']:+.0f} mm")
+    _chk_true("select='peak' takes the layer with the most inserts",
+              restricted["z_lo_mm"] >= -1430,
+              f"chose {restricted['z_lo_mm']:+.0f}..{restricted['z_hi_mm']:+.0f} mm "
+              f"(18-insert layer at -1425..-1410, not the 10-insert one at -1500..-1470)")
+    _chk_true("every candidate layer is reported",
+              len(restricted["candidates"]) >= 2,
+              f"{len(restricted['candidates'])} candidates")
 
 
 def main() -> int:

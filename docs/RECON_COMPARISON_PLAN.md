@@ -160,6 +160,25 @@ minority of deviant voxels, so it stays flat straight through the insert layer. 
 is eroded before scoring, because smoothing drags −1000 HU air across the boundary and would
 otherwise score a "structure" rim in *every* slice.
 
+**`--phantom-z` is effectively required on a clinical scan range.** The first run searched the
+whole Thx–Abdomen acquisition and selected a slab at z ≈ −2125 mm — roughly **665 mm from the
+phantom**, which sits at −1515.5…−1408.3 mm. A long acquisition contains the table,
+positioning aids and scan-end artefacts, any of which can out-score the phantom. Passing the
+phantom's axial extent (read off the vendor volume in Slicer) confines the search and also
+limits how much of a multi-thousand-slice series is read; `--no-phantom-z` restores the
+unrestricted search. Note the `=` form — `--phantom-z=-1515.5,-1408.3` — because a value
+beginning with `-` is otherwise parsed as a flag (the same applies to `--slab`).
+
+Detection now returns **every** candidate layer, not just the winner; all are logged and drawn
+on the QC figure, so "picked the wrong layer" is distinguishable from "only one layer exists",
+and `--slab` can force a different one. `--slab-select peak` (default) takes the layer holding
+the most insert-covered slice — the score is essentially insert area fraction, so this prefers
+the layer carrying the most inserts, **including one sitting hard against the end of the
+phantom**, which is the layer most at risk of being missed. `--slab-select longest` restores
+the previous longest-run behaviour. `--expect-inserts N` warns when the detected count
+disagrees; that matters beyond TTF, because an undetected insert stays *inside* the background
+region and inflates the noise estimate.
+
 **Skip logic.** A variant counts as done only if all four volumes exist **and** its recorded
 `sweep_config.json` signature matches (slab, grid, thickness, weighting, defect thresholds,
 data path). File existence alone would silently reuse volumes reconstructed from a different
@@ -206,6 +225,14 @@ kernel of its window, so power leaks from strong bins into weak ones. Measured e
 while the spectrum falls ≲1000× across the band (the realistic CT case) and grows as it
 steepens. Compare curves within ~2 decades of the peak; do not read the extreme tail
 quantitatively.
+
+**NPS patch size is set by the phantom, not by preference.** The vendor exports this
+phantom at a whole-body FOV (500 mm on 512 px → 0.977 mm pixels), so a 64 px patch is
+62 mm wide and **no such square of clear background exists** inside a ~200 mm phantom
+between its inserts. `auto_background_patches` halves the request until enough fit
+(32 px ≈ 31 mm here) and the chosen size is then **shared by every family**, because the
+NPS frequency grid depends on it and curves measured at different sizes are not
+comparable. The size actually used is logged and stored with the metrics.
 
 **ROI placement is automatic and must still be eyeballed.** Detection runs once per family on
 the **z-average** of the slab (√Z better SNR, and the inserts are z-invariant within the layer
