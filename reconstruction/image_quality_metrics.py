@@ -201,7 +201,8 @@ def refine_insert_geometry(img_hu, cy, cx, r_guess_px, search=2.5):
 
 
 def inserts_from_labelmap(label_vol, img_hu, pixel_mm, refine=True,
-                          min_diameter_mm=3.0, max_diameter_mm=40.0):
+                          min_diameter_mm=3.0, max_diameter_mm=40.0,
+                          air_hu=-300.0):
     """
     Turn a hand-drawn label map into insert ROIs, with edges refined from the image.
 
@@ -221,7 +222,12 @@ def inserts_from_labelmap(label_vol, img_hu, pixel_mm, refine=True,
         raise ValueError(f"inserts_from_labelmap: label shape {lab_in.shape} != image "
                          f"shape {img.shape} -- resample the segmentation first")
 
-    bg = float(np.median(img[lab_in == 0])) if np.any(lab_in == 0) else float(np.median(img))
+    # Reference level for the contrast figures: the surrounding TISSUE, not air.
+    # Taking the median over everything unlabelled includes the air around the
+    # phantom, which for a body occupying a fraction of the FOV is the majority of
+    # the image -- every insert would then be reported at ~+1000 HU contrast.
+    outside = (lab_in == 0) & (img > air_hu)
+    bg = float(np.median(img[outside])) if outside.any() else float(np.median(img))
     out = []
     for value in sorted(int(v) for v in np.unique(lab_in) if v > 0):
         group = lab_in == value
@@ -252,6 +258,85 @@ def inserts_from_labelmap(label_vol, img_hu, pixel_mm, refine=True,
     return out
 
 
+def homogeneous_mask(img_hu, body_mask, pixel_mm, window_mm=6.0, hu_band=75.0,
+                     flat_tolerance=1.6, erode_mm=2.0):
+    """
+    Restrict a body mask to the parts that are actually UNIFORM.
+
+    A noise measurement assumes the region under it contains nothing but noise.  That
+    holds for a uniform cylinder, and fails completely for an anthropomorphic phantom:
+    lung, bone, mediastinum and the patient table all sit inside the body outline, and a
+    patch dropped on any of them measures anatomy.  The symptom is unmistakable once you
+    know it -- a noise "SD" of a few hundred HU and an f_av of ~0.08 cyc/mm, i.e. a noise
+    grain of over a centimetre, which is structure, not noise.
+
+    Two criteria, both computed on the slab z-average so that quantum noise (already
+    suppressed by sqrt(Z)) does not drive them:
+      * HU band     -- within hu_band of the modal soft-tissue value, which removes lung
+                       (very negative) and bone/table (very positive).
+      * local flatness -- local standard deviation in a window_mm box no more than
+                       flat_tolerance x its median, which removes edges, gradients
+                       and residual structure while keeping uniform material whole.
+
+    Returns a bool mask.  Prefer an explicitly drawn background region when one is
+    available; this is the automatic fallback.
+    """
+    img = np.asarray(img_hu, dtype=np.float64)
+    if not np.any(body_mask):
+        return np.zeros(img.shape, dtype=bool)
+
+    vals = img[body_mask]
+    hist, edges = np.histogram(vals, bins=128)
+    mode = 0.5 * (edges[int(np.argmax(hist))] + edges[int(np.argmax(hist)) + 1])
+    band = body_mask & (np.abs(img - mode) < hu_band)
+    if band.sum() < 64:
+        band = body_mask.copy()
+
+    w = max(3, int(round(window_mm / pixel_mm)) | 1)
+    mean = ndimage.uniform_filter(img, size=w)
+    mean_sq = ndimage.uniform_filter(img * img, size=w)
+    local_sd = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+
+    # Threshold RELATIVE to the typical local SD, not at a fixed percentile.  A percentile
+    # keeps exactly that fraction by construction, and in uniform material -- where local
+    # SD is nearly constant and the ranking is pure chance -- the survivors are speckle
+    # rather than a region, which the following erosion then annihilates (measured: 1.4 %
+    # of a completely uniform body surviving a "keep the flattest 50 %" rule).  A relative
+    # threshold keeps essentially all of a homogeneous area as one connected region while
+    # still rejecting lung, bone, table and edges, whose local SD is many times higher.
+    ref = float(np.median(local_sd[band]))
+    thr = ref * float(flat_tolerance) if ref > 0 else float(np.percentile(local_sd[band], 75))
+    keep = band & (local_sd <= thr)
+    keep = ndimage.binary_closing(keep, _disk(max(1, int(round(2.0 / pixel_mm)))))
+    keep &= band
+    if erode_mm > 0:
+        keep = ndimage.binary_erosion(keep, _disk(max(1, int(round(erode_mm / pixel_mm)))))
+    return keep
+
+
+def noise_region(region_mask, inserts, pixel_mm, insert_margin_mm=6.0,
+                 edge_margin_mm=10.0):
+    """
+    The region a noise measurement may use: `region_mask`, pulled back from its own edge
+    and with every insert (plus a margin) cut out.
+
+    Both exclusions are mandatory, not cosmetic.  An insert left inside contributes its
+    full contrast to the "noise", which is how a 42 HU image comes to measure 51 HU -- and
+    because the contrast is identical in every channel while the noise is not, it also
+    compresses and can even invert the ranking the whole comparison exists to establish.
+    """
+    keep = np.asarray(region_mask, dtype=bool)
+    if edge_margin_mm > 0:
+        keep = ndimage.binary_erosion(keep, _disk(max(1, int(round(edge_margin_mm / pixel_mm)))))
+    if inserts:
+        ny, nx = keep.shape
+        y, x = np.ogrid[:ny, :nx]
+        for ins in inserts:
+            r = ins["radius_px"] + insert_margin_mm / pixel_mm
+            keep &= ((y - ins["cy"]) ** 2 + (x - ins["cx"]) ** 2) > r * r
+    return keep
+
+
 def background_patches(body_mask, inserts, pixel_mm, patch_px=64,
                        insert_margin_mm=6.0, edge_margin_mm=10.0, max_patches=64):
     """
@@ -264,17 +349,16 @@ def background_patches(body_mask, inserts, pixel_mm, patch_px=64,
     Returns a list of (y0, x0) top-left origins.
     """
     ny, nx = body_mask.shape
-    keep = ndimage.binary_erosion(body_mask, _disk(max(1, int(round(edge_margin_mm / pixel_mm)))))
-    for ins in inserts:
-        r = ins["radius_px"] + insert_margin_mm / pixel_mm
-        y, x = np.ogrid[:ny, :nx]
-        keep &= ((y - ins["cy"]) ** 2 + (x - ins["cx"]) ** 2) > r * r
+    keep = noise_region(body_mask, inserts, pixel_mm, insert_margin_mm, edge_margin_mm)
 
     # Integral image -> a patch is valid iff every pixel under it is valid.
     ii = np.cumsum(np.cumsum(keep.astype(np.int32), axis=0), axis=1)
     p = int(patch_px)
     out = []
-    step = max(p // 2, 8)                       # 50 % overlap: more patches, same area
+    step = max(p // 4, 4)   # 75 % overlap. Overlapping patches are correlated and so
+                            # add less than N independent samples, but on a phantom with
+                            # only a small uniform region they are the difference between
+                            # a usable NPS and three patches.
     for y0 in range(0, ny - p + 1, step):
         for x0 in range(0, nx - p + 1, step):
             y1, x1 = y0 + p - 1, x0 + p - 1
@@ -293,8 +377,8 @@ def background_patches(body_mask, inserts, pixel_mm, patch_px=64,
     return out
 
 
-def auto_background_patches(body_mask, inserts, pixel_mm, patch_px=64, min_patches=8,
-                            min_patch_px=16, **kw):
+def auto_background_patches(body_mask, inserts, pixel_mm, patch_px=64, min_patches=4,
+                            min_patch_px=12, **kw):
     """
     background_patches() with automatic size reduction.
 
@@ -374,6 +458,49 @@ def _detrend_nps_response(p, order):
     # quadratic form g^T M^-1 conj(g) evaluated at every frequency bin at once
     quad = np.einsum("iyx,ij,jyx->yx", G, M_inv, np.conj(G)).real
     return np.clip(1.0 - quad / N, 0.0, 1.0)
+
+
+def region_noise_sd(volume, region_mask, detrend_order=2, slices=None):
+    """
+    Noise SD over an arbitrary region, WITHOUT requiring square patches.
+
+    The NPS needs square blocks because it is a Fourier estimate, but the noise magnitude
+    does not -- and on a phantom whose uniform material is a thin ring of matrix between
+    inserts, no square of useful size fits while there are still tens of thousands of
+    perfectly good voxels.  Tying the headline noise number to the patch geometry would
+    throw those away and report nothing at all.
+
+    A low-order 2-D polynomial is fitted over the region's own coordinates and subtracted
+    (the same detrending the patches get, generalised to an arbitrary shape), so residual
+    cupping or shading across the region does not masquerade as noise.
+
+    Returns (sd, n_voxels_per_slice).
+    """
+    vol = np.asarray(volume, dtype=np.float64)
+    if vol.ndim == 2:
+        vol = vol[None]
+    mask = np.asarray(region_mask, dtype=bool)
+    if mask.sum() < 16:
+        return float("nan"), 0
+    ys, xs = np.nonzero(mask)
+    ny, nx = mask.shape
+    y = (ys - ny / 2) / ny
+    x = (xs - nx / 2) / nx
+    cols = [np.ones(ys.size)]
+    for i in range(1, max(0, int(detrend_order)) + 1):
+        for j in range(i + 1):
+            cols.append(y ** (i - j) * x ** j)
+    A = np.stack(cols, axis=1)
+    pinv = np.linalg.pinv(A)
+
+    idx = range(vol.shape[0]) if slices is None else slices
+    acc, n = 0.0, 0
+    for z in idx:
+        v = vol[z][ys, xs]
+        resid = v - A @ (pinv @ v)
+        acc += float(np.mean(resid * resid))
+        n += 1
+    return (float(np.sqrt(acc / n)) if n else float("nan")), int(ys.size)
 
 
 def noise_power_spectrum(volume, patches, pixel_mm, patch_px=64, slices=None,

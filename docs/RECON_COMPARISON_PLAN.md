@@ -255,11 +255,45 @@ reported as a finding rather than a nuisance: for `own` it means our helical z a
 vendor's `ImagePositionPatient` z are not the same frame (see §9), and the family falls back
 to automatic detection.
 
+**The phantom is anthropomorphic, which changes where noise may be measured.** It is a
+thorax phantom with an insert module, not a uniform cylinder: lung, bone and the patient
+table all lie inside the body outline. Background patches placed on the body outline
+therefore measured anatomy — the first full run reported 54–250 HU "noise" with an f_av of
+0.078 cyc/mm, a noise grain over a centimetre wide, which is structure. Three consequences,
+all now enforced in code:
+
+0. The background segment may be drawn as a filled region **or as the module's outline**
+   — the interior is filled (`binary_fill_holes`), which matters because Slicer's
+   fill-between-slices needs a clear path and tracing the boundary avoids the inserts
+   entirely. It may also overlap the inserts: the background label is applied with
+   explicit low priority, so an insert is never overwritten by it (an overwritten insert
+   would go undetected and then be counted as noise). Outline, solid-over-inserts and
+   solid-avoiding-inserts were verified to give identical inserts, region and noise SD.
+1. The noise region is the drawn `--background-label` segment when supplied, else an
+   automatically detected homogeneous region (`homogeneous_mask`: within an HU band of the
+   modal tissue value AND locally flat), and only as a last resort the body outline, which
+   is logged as UNRELIABLE.
+2. Inserts and the region edge are removed from the noise region **always**, whatever its
+   source. An insert left inside contributes its full contrast: measured 102 HU against a
+   true 40 HU, and because the contrast is identical in every channel while the noise is
+   not, it compresses and can invert the very ranking the study exists to establish.
+3. The noise **SD** is measured over the whole region and needs no square blocks; only the
+   NPS *curve* does. Tying the headline number to patch geometry would report nothing at
+   all on a phantom whose uniform material is a thin ring of matrix between inserts.
+
+`homogeneous_mask` thresholds local SD **relative to its median**, not at a fixed
+percentile: a percentile keeps exactly that fraction by construction, and in uniform
+material — where the ranking is pure chance — the survivors are speckle, which the
+following erosion destroys (measured: 1.4 % of a completely uniform body surviving a "keep
+the flattest 50 %" rule, which then silently forced the fallback to the body outline).
+
 **ROI placement is automatic and must still be eyeballed.** Detection runs once per family on
 the **z-average** of the slab (√Z better SNR, and the inserts are z-invariant within the layer
 stage 0 selected), then the same ROIs are reused for every channel and variant of that family
-— so a metric difference can never come from the ROIs having moved. Every run writes
-`qc/roi_*.png` overlays; automatic detection that nobody looks at is how a results chapter
+— so a metric difference can never come from the ROIs having moved. Every run writes a `qc/roi_*.nrrd` LABEL VOLUME (plus a `.json` sidecar naming each
+label), loadable straight into Slicer on top of the data — a single mid-slice picture can
+only ever show one plane, and whether a patch touches an insert is a question you answer by
+scrolling; automatic detection that nobody looks at is how a results chapter
 quietly goes wrong. The overlays double as an appendix figure.
 
 ## 9. Open risk

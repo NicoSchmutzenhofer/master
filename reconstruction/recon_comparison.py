@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from scipy import ndimage
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -150,6 +151,10 @@ class CompareConfig:
     # roughly right: every edge is refined from the image, and a partial annotation is
     # fine.  Auto-discovered as <wfbp_dir>/Segmentation.nrrd when not given.
     segmentation: Optional[str] = None
+    # Label value inside the segmentation that marks the UNIFORM region the noise is
+    # measured in.  Strongly recommended on an anthropomorphic phantom, where the body
+    # outline contains lung, bone and the table and is not a noise region at all.
+    background_label: Optional[int] = None
     task_diameter_mm: float = 5.0
     task_contrast_hu: float = 50.0
     bias_smooth_mm: float = 5.0
@@ -168,7 +173,7 @@ def _sitk():
     return sitk
 
 
-def load_segmentation(path, ref_img):
+def load_segmentation(path, ref_img, low_priority_label=None):
     """
     Read a Slicer segmentation and resample it onto `ref_img`'s grid.
 
@@ -188,7 +193,7 @@ def load_segmentation(path, ref_img):
     layers = ([seg[:, :, :, i] for i in range(seg.GetSize()[3])]
               if seg.GetDimension() == 4 else [seg])
 
-    merged = None
+    merged, deferred = None, None
     for i, layer in enumerate(layers):
         r = sitk.Resample(layer, ref_img, sitk.Transform(), sitk.sitkNearestNeighbor,
                           0, sitk.sitkUInt16)
@@ -197,8 +202,16 @@ def load_segmentation(path, ref_img):
             merged = np.zeros_like(a)
         if len(layers) == 1:
             merged = a                       # already a label map with distinct values
+        elif low_priority_label is not None and i + 1 == int(low_priority_label):
+            deferred = a > 0                 # applied last, and only where nothing else is
         else:
             merged[a > 0] = i + 1
+    if deferred is not None:
+        # The background segment is allowed to overlap the inserts -- painting the whole
+        # module is the natural way to draw it -- but an insert must never be overwritten
+        # by it, or it would go undetected and then be counted as noise.  Priority is
+        # explicit rather than depending on the order the segments happen to be stored in.
+        merged[(merged == 0) & deferred] = int(low_priority_label)
     if merged is None or not np.any(merged > 0):
         return None
     return merged
@@ -506,12 +519,22 @@ def stage0_probe(cfg: CompareConfig):
     # is flat -- inserts that run as rods along z produce no distinguishable "layer", and
     # the score then spans the whole phantom and gets blindly trimmed to its middle.
     if cfg.segmentation and cfg.use_phantom_z is not False:
-        labels = load_segmentation(cfg.segmentation, img)
+        labels = load_segmentation(cfg.segmentation, img,
+                                   low_priority_label=cfg.background_label)
         if labels is None:
             logger.warning("segmentation %s does not overlap the reference volume -- "
                            "keeping the detected slab", cfg.segmentation)
         else:
-            kz = np.where(labels.reshape(labels.shape[0], -1).any(axis=1))[0]
+            # The slab is defined by where the INSERTS are, so the background segment is
+            # excluded here: it may be drawn over a different z range (or over the whole
+            # module), and letting it stretch the slab would move the measurement away
+            # from the inserts the TTF depends on.
+            insert_labels = labels
+            if cfg.background_label:
+                insert_labels = np.where(labels == int(cfg.background_label), 0, labels)
+            kz = np.where(insert_labels.reshape(insert_labels.shape[0], -1).any(axis=1))[0]
+            if kz.size == 0:
+                kz = np.where(labels.reshape(labels.shape[0], -1).any(axis=1))[0]
             z_lo = float(zpos[kz].min()) - cfg.slab_pad_mm
             z_hi = float(zpos[kz].max()) + cfg.slab_pad_mm
             slab_source = f"segmentation ({Path(cfg.segmentation).name})"
@@ -553,6 +576,11 @@ def stage0_probe(cfg: CompareConfig):
                           "n_files": len(c["files"])}
                          for c in v] for k, v in families.items()},
         "wfbp_dir": cfg.wfbp_dir, "vmi_dir": cfg.vmi_dir,
+        # Persisted because each stage is a SEPARATE process: stage 2 is invoked
+        # without --wfbp-dir, so auto-discovery cannot run there and the segmentation
+        # would silently be dropped between stages.
+        "segmentation": cfg.segmentation,
+        "background_label": cfg.background_label,
     }
     _write_json(out / "match_config.json", match)
     logger.info("wrote %s", out / "match_config.json")
@@ -758,7 +786,8 @@ def stage1_sweep(cfg: CompareConfig):
 # ═════════════════════════════════════════════════════════════════════
 # Stage 2 -- metrics
 # ═════════════════════════════════════════════════════════════════════
-def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patch_px):
+def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patch_px,
+                    region):
     """
     Full metric set for one volume, given ROIs fixed by the family's reference.
 
@@ -769,14 +798,27 @@ def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patc
     cutting the noise that would otherwise corrupt the differentiated edge profile.
     """
     res = {}
-    nps = iq.noise_power_spectrum(vol, patches, pixel_mm, patch_px=patch_px)
-    res["noise_sd_hu"] = nps["noise_sd_hu"]
-    res["f_av"] = nps["f_av"]
-    res["f_peak"] = nps["f_peak"]
-    res["nps_f"] = nps["f"]
-    res["nps"] = nps["nps"]
-    res["n_patches"] = nps["n_patches"]
-    res["patch_heterogeneity"] = nps["patch_heterogeneity"]
+    # Noise MAGNITUDE from the whole region: needs no square blocks, so it survives a
+    # phantom whose uniform material is only a thin ring between inserts.
+    sd, n_vox = iq.region_noise_sd(vol, region)
+    res["noise_sd_hu"] = sd
+    res["noise_region_px"] = n_vox
+    # Noise TEXTURE needs a Fourier estimate, hence square patches; it degrades to
+    # unavailable rather than dragging the magnitude down with it.
+    if patches:
+        nps = iq.noise_power_spectrum(vol, patches, pixel_mm, patch_px=patch_px)
+        res["f_av"] = nps["f_av"]
+        res["f_peak"] = nps["f_peak"]
+        res["nps_f"] = nps["f"]
+        res["nps"] = nps["nps"]
+        res["n_patches"] = nps["n_patches"]
+        res["patch_heterogeneity"] = nps["patch_heterogeneity"]
+        res["nps_sd_hu"] = nps["noise_sd_hu"]
+    else:
+        res["f_av"] = float("nan")
+        res["f_peak"] = float("nan")
+        res["n_patches"] = 0
+        nps = None
 
     flat = vol.mean(axis=0)
     best = None
@@ -793,11 +835,13 @@ def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patc
                     "edge_width_1090_mm": best["edge_width_1090_mm"],
                     "ttf_contrast_hu": best["contrast_hu"],
                     "ttf_f": best["f"], "ttf": best["ttf"]})
-        f_neq, val = iq.neq(best["f"], best["ttf"], nps["f"], nps["nps"],
-                            contrast_hu=abs(best["contrast_hu"]) or 1.0)
-        res["neq_f"], res["neq"] = f_neq, val
-        res.update(iq.detectability_index(best["f"], best["ttf"], nps["f"], nps["nps"],
-                                          cfg.task_diameter_mm, cfg.task_contrast_hu))
+        if nps is not None:
+            f_neq, val = iq.neq(best["f"], best["ttf"], nps["f"], nps["nps"],
+                                contrast_hu=abs(best["contrast_hu"]) or 1.0)
+            res["neq_f"], res["neq"] = f_neq, val
+            res.update(iq.detectability_index(best["f"], best["ttf"], nps["f"],
+                                              nps["nps"], cfg.task_diameter_mm,
+                                              cfg.task_contrast_hu))
     else:
         logger.warning("    no usable edge -- TTF/NEQ/d' unavailable for this volume")
 
@@ -822,10 +866,11 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
     flat = vol_ref.mean(axis=0)
     body = iq.detect_body_mask(flat, pixel_mm)
 
-    inserts, source = [], "auto"
+    inserts, source, bg_region = [], "auto", None
     seg_path = cfg.segmentation
     if seg_path and ref_img is not None:
-        labels = load_segmentation(seg_path, ref_img)
+        labels = load_segmentation(seg_path, ref_img,
+                                   low_priority_label=cfg.background_label)
         if labels is None:
             # Empty overlap is itself a finding: the segmentation was drawn on the vendor
             # volume, so if it maps nowhere onto ours the two z frames disagree.
@@ -834,6 +879,19 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
                            "ImagePositionPatient z are NOT the same frame. Falling back "
                            "to automatic detection for this family.", tag)
         else:
+            if cfg.background_label:
+                # One drawn segment marks the uniform region the noise is measured in.
+                # It must NOT also be treated as an insert.
+                drawn = np.any(labels == int(cfg.background_label), axis=0)
+                # Filling means an OUTLINE of the module works as well as a solid
+                # paint -- which matters because Slicer's fill-between-slices needs
+                # a clear path, and tracing the module boundary avoids the inserts
+                # entirely.  A solid region is unchanged by this.
+                bg_region = ndimage.binary_fill_holes(drawn)
+                labels = np.where(labels == int(cfg.background_label), 0, labels)
+                logger.info("  %s: background from label %s -- %d px drawn, %d px "
+                            "after filling the interior", tag, cfg.background_label,
+                            int(drawn.sum()), int(bg_region.sum()))
             inserts = iq.inserts_from_labelmap(labels, flat, pixel_mm, refine=True)
             source = f"segmentation ({Path(seg_path).name})"
             n_ref = sum(1 for i in inserts if i["refined"])
@@ -849,22 +907,54 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
         inserts = iq.detect_inserts(flat, body, pixel_mm,
                                     contrast_mad_k=cfg.insert_mad_k)
 
+    # ---- where the noise is measured -------------------------------------------
+    # The body outline is NOT a noise region on an anthropomorphic phantom: lung, bone,
+    # mediastinum and the table all lie inside it, and a patch on any of them measures
+    # anatomy.  Preference order: a drawn background segment, else the automatically
+    # detected homogeneous region, and only as a last resort the whole body.
+    if bg_region is not None:
+        region, region_src, edge_mm = bg_region, "drawn background label", 2.0
+    else:
+        region = iq.homogeneous_mask(flat, body, pixel_mm)
+        lab, nlab = ndimage.label(region)
+        if nlab > 1:                       # a fragmented mask cannot hold square patches
+            sizes = ndimage.sum(region, lab, range(1, nlab + 1))
+            region = lab == (1 + int(np.argmax(sizes)))
+        region_src, edge_mm = "auto homogeneous region", 2.0
+        if region.sum() < 0.02 * max(body.sum(), 1):
+            logger.warning("  %s: the homogeneous region is only %d px; falling back to "
+                           "the whole body, which on a non-uniform phantom measures "
+                           "anatomy rather than noise", tag, int(region.sum()))
+            region, region_src, edge_mm = body, "body outline (UNRELIABLE)", 10.0
+
     if force_patch_px:
         # Every family must share one patch size: the NPS frequency grid depends on it,
         # so curves measured at different sizes are not comparable.
-        patches = iq.background_patches(body, inserts, pixel_mm, patch_px=force_patch_px)
+        patches = iq.background_patches(region, inserts, pixel_mm, patch_px=force_patch_px,
+                                        edge_margin_mm=edge_mm)
         patch_px, tried = force_patch_px, [(force_patch_px, len(patches))]
-        if len(patches) < 8:
-            logger.warning("  %s: only %d patches at the family patch size %d px -- NPS "
-                           "statistics for this family will be thin", tag, len(patches),
-                           force_patch_px)
     else:
         patches, patch_px, tried = iq.auto_background_patches(
-            body, inserts, pixel_mm, patch_px=cfg.nps_patch_px)
+            region, inserts, pixel_mm, patch_px=cfg.nps_patch_px, edge_margin_mm=edge_mm)
         if patch_px != cfg.nps_patch_px:
             logger.info("  %s: %d px patches did not fit; using %d px (%.1f mm). Tried %s",
                         tag, cfg.nps_patch_px, patch_px, patch_px * pixel_mm,
                         ", ".join(f"{s}px->{n}" for s, n in tried))
+    # Whatever the region came from, the inserts and the edge must come OUT of it before
+    # anything is measured -- otherwise insert contrast is counted as noise.
+    region = iq.noise_region(region, inserts, pixel_mm, edge_margin_mm=edge_mm)
+    logger.info("  %s: noise region = %s (%d px, %.0f mm2 after removing inserts+edge)",
+                tag, region_src, int(region.sum()), region.sum() * pixel_mm ** 2)
+    if region.sum() < 200:
+        logger.warning("  %s: the noise region is only %d px -- the noise SD will be very "
+                       "uncertain. Draw a background segment and pass --background-label.",
+                       tag, int(region.sum()))
+    if len(patches) < 8 or patch_px < 24:
+        logger.warning("  %s: only %d patches of %d px (%.1f mm) -- the noise SD is still "
+                       "usable but the NPS CURVE is coarse (%d frequency bins to Nyquist) "
+                       "and f_av is unreliable. Draw a background segment in a uniform "
+                       "part of the phantom and pass --background-label to fix this.",
+                       tag, len(patches), patch_px, patch_px * pixel_mm, patch_px // 2)
 
     body_px = int(body.sum())
     logger.info("  %s: body %d px (%.0f mm2), %d inserts [%s], %d NPS patches of "
@@ -886,42 +976,65 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
 
     # Written BEFORE any failure: when detection goes wrong the overlay is the only way
     # to see why, so it must exist even on the unhappy path.
-    _qc_roi_figure(qc_dir / f"roi_{tag}.png", flat, body, inserts, patches, patch_px,
-                   f"{tag}  (ROIs: {source})")
+    _qc_roi_volume(Path(qc_dir) / f"roi_{tag}.nrrd", vol_ref.shape[0], flat.shape, ref_img,
+                   body, inserts, patches, patch_px, tag, source)
 
     if not patches:
-        raise ValueError(
-            f"{tag}: no uniform background patches fit. body={body_px} px "
-            f"({body_px * pixel_mm ** 2:.0f} mm2), {len(inserts)} inserts, pixel "
-            f"{pixel_mm:.4f} mm; tried "
-            f"{', '.join(f'{s}px({s * pixel_mm:.0f}mm)->{n}' for s, n in tried)}. "
-            f"Look at qc/roi_{tag}.png -- if the blue body outline is wrong the HU "
-            f"calibration is off; if it is right, pass a smaller --nps-patch-px.")
-    return body, inserts, patches, patch_px
+        logger.warning(
+            "  %s: no square patch fits the noise region, so the NPS curve, f_av, NEQ and "
+            "d' are unavailable for this family. The noise SD is still measured over the "
+            "whole region and remains valid. Tried %s", tag,
+            ", ".join(f"{s}px({s * pixel_mm:.0f}mm)->{n}" for s, n in tried))
+    return body, inserts, patches, patch_px, region
 
 
-def _qc_roi_figure(path, img, body, inserts, patches, patch_px, tag):
-    plt = _mpl()
-    if plt is None:
-        return
-    from matplotlib.patches import Circle, Rectangle
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.imshow(img, cmap="gray", vmin=-200, vmax=300)
-    ax.contour(body, levels=[0.5], colors="tab:blue", linewidths=0.8)
-    for y0, x0 in patches:
-        ax.add_patch(Rectangle((x0, y0), patch_px, patch_px, fill=False,
-                               ec="tab:green", lw=0.6))
+def _qc_roi_volume(path, n_slices, shape_yx, ref_img, body, inserts, patches, patch_px,
+                   tag, source):
+    """
+    Write the ROI placement as a 3-D LABEL VOLUME, loadable straight into Slicer on top
+    of the data, instead of a single-slice picture.
+
+    A mid-slice PNG can only ever show one plane, and the thing that has to be checked --
+    do the circles sit on the inserts, does any NPS patch touch one -- is easier to judge
+    while scrolling through the actual volume.  The labels are replicated through z
+    because the ROIs really are applied to every slice of the slab (the NPS is measured
+    on all of them), so the volume is a faithful picture of what was measured, not a
+    stylised one.
+
+    Label values (also written to the .json sidecar):
+        1              NPS background patches -- the noise was measured HERE
+        2 + i          insert i, at its measured radius
+    The body is not painted; it is plainly visible in the underlying image.
+    """
+    sitk = _sitk()
+    ny, nx = shape_yx
+    plane = np.zeros((ny, nx), dtype=np.uint16)
+    for (y0, x0) in patches:
+        plane[y0:y0 + patch_px, x0:x0 + patch_px] = 1
+    yy, xx = np.ogrid[:ny, :nx]
+    legend = {"1": "NPS background patches"}
     for i, ins in enumerate(inserts):
-        ax.add_patch(Circle((ins["cx"], ins["cy"]), ins["radius_px"], fill=False,
-                            ec="tab:orange", lw=1.4))
-        ax.text(ins["cx"], ins["cy"], str(i), color="tab:orange", ha="center",
-                va="center", fontsize=9)
-    ax.set_title(f"ROI placement -- {tag}\n"
-                 f"blue = body, orange = inserts, green = NPS patches")
-    ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
+        disc = ((yy - ins["cy"]) ** 2 + (xx - ins["cx"]) ** 2) <= ins["radius_px"] ** 2
+        plane[disc] = 2 + i          # inserts win over patches so overlap is visible
+        legend[str(2 + i)] = (f"insert {i}  r={ins['radius_mm']:.2f} mm  "
+                              f"{ins.get('contrast_hu', float('nan')):+.0f} HU"
+                              + ("  [refined]" if ins.get("refined") else ""))
+
+    vol = np.repeat(plane[None], max(1, int(n_slices)), axis=0)
+    img = sitk.GetImageFromArray(vol)
+    if ref_img is not None:          # carry the geometry so it overlays correctly
+        img.SetSpacing(ref_img.GetSpacing())
+        img.SetOrigin(ref_img.GetOrigin())
+        img.SetDirection(ref_img.GetDirection())
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(img, str(path))
+
+    _write_json(Path(path).with_suffix(".json"), {
+        "tag": tag, "roi_source": source, "patch_px": int(patch_px),
+        "n_inserts": len(inserts), "n_patches": len(patches),
+        "labels": legend,
+        "inserts": [{k: v for k, v in ins.items() if k != "area_px"} for ins in inserts],
+    })
 
 
 def stage2_metrics(cfg: CompareConfig):
@@ -933,6 +1046,12 @@ def stage2_metrics(cfg: CompareConfig):
     (out / "figures").mkdir(parents=True, exist_ok=True)
     qc = out / "qc"
     qc.mkdir(parents=True, exist_ok=True)
+
+    if not cfg.segmentation and match.get("segmentation"):
+        cfg.segmentation = match["segmentation"]
+        logger.info("segmentation carried over from stage 0: %s", cfg.segmentation)
+    if cfg.background_label is None and match.get("background_label"):
+        cfg.background_label = match["background_label"]
 
     zr = (match["z_lo_mm"], match["z_hi_mm"])
     results = {"match_config": match, "own": {}, "wfbp": {}, "vmi": {}}
@@ -956,10 +1075,10 @@ def stage2_metrics(cfg: CompareConfig):
             if own_ctx is None:      # detect once, reuse for every variant/threshold
                 own_ctx = _family_rois(vol, pixel_mm, cfg, "own", qc, ref_img=img_own)
                 shared_patch_px = own_ctx[3]
-            body, inserts, patches, patch_px = own_ctx
+            body, inserts, patches, patch_px, region = own_ctx
             logger.info("own/%s thr %s", v["name"], label)
             results["own"][v["name"]][label] = _measure_volume(
-                vol, pixel_mm, inserts, cfg, body, patches, patch_px)
+                vol, pixel_mm, inserts, cfg, body, patches, patch_px, region)
             del vol
             gc.collect()
 
@@ -978,10 +1097,11 @@ def stage2_metrics(cfg: CompareConfig):
                                    force_patch_px=shared_patch_px, ref_img=img)
                 if shared_patch_px is None:
                     shared_patch_px = ctx[3]
-            body, inserts, patches, patch_px = ctx
+            body, inserts, patches, patch_px, region = ctx
             logger.info("%s %s", kind, c["label"])
             results[kind][c["label"]] = _measure_volume(vol, pixel_mm, inserts, cfg,
-                                                        body, patches, patch_px)
+                                                        body, patches, patch_px,
+                                                        region)
             results[kind][c["label"]]["pixel_mm"] = pixel_mm
             results[kind][c["label"]]["kernel"] = c["kernel"]
             if kind == "wfbp":
@@ -1008,7 +1128,7 @@ def _bias_analysis(cfg, match, wfbp_vols, own_ctx):
     """Systematic (low-frequency) difference between our recon and WFBP, per threshold."""
     sitk = _sitk()
     out = Path(cfg.out_root)
-    body, inserts, _patches, _patch_px = own_ctx
+    body, inserts, _patches, _patch_px, _region = own_ctx
     pixel_mm = match["pixel_mm"]
     bias = {}
     # T1..T4 are the vendor's names for the same cumulative thresholds as our A..D.
@@ -1115,10 +1235,10 @@ def _figures(cfg, out, res, match):
         ax = axes[0][j]
         for vname in [v["name"] for v in cfg.variants]:
             m = res["own"].get(vname, {}).get(label)
-            if m:
+            if m and "nps_f" in m:
                 ax.plot(m["nps_f"], m["nps"], lw=1.1, label=vname)
         wf = res["wfbp"].get(f"T{j + 1}")
-        if wf:
+        if wf and "nps_f" in wf:
             ax.plot(wf["nps_f"], wf["nps"], "k--", lw=1.8, label="WFBP")
         ax.set_xlabel("spatial frequency (cyc/mm)")
         if j == 0:
@@ -1126,7 +1246,7 @@ def _figures(cfg, out, res, match):
         ax.set_title(f"threshold {label}")
         ax.set_yscale("log")
         ax.grid(alpha=0.3)
-        if j == 0:
+        if j == 0 and ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=7)
     fig.suptitle("Noise power spectra -- magnitude AND texture "
                  "(a leftward shift means blotchier noise, i.e. denoising)")
@@ -1270,6 +1390,11 @@ def build_parser():
                         "only need to be roughly right - every edge is refined from "
                         "the image, and a partial annotation is fine. Defaults to "
                         "<wfbp-dir>/Segmentation.nrrd if that exists")
+    p.add_argument("--background-label", type=int, metavar="N",
+                   help="label value in the segmentation marking a UNIFORM region for "
+                        "the noise measurement. On an anthropomorphic phantom this is "
+                        "close to required: the body outline contains lung, bone and "
+                        "the table, none of which are noise")
     p.add_argument("--insert-mad-k", type=float, default=4.0,
                    help="insert-detection sensitivity in robust SDs; lower finds "
                         "fainter inserts. Check qc/roi_*.png after changing it")
@@ -1317,7 +1442,7 @@ def main(argv=None):
         data_path=a.data_path, desc_path=a.desc_path, geo_dir=a.geo_dir,
         n_pixels=a.n_pixels, fov_mm=a.fov_mm, max_slab_mm=a.max_slab_mm,
         nps_patch_px=a.nps_patch_px, insert_mad_k=a.insert_mad_k,
-        segmentation=a.segmentation,
+        segmentation=a.segmentation, background_label=a.background_label,
         task_diameter_mm=a.task_diameter_mm,
         task_contrast_hu=a.task_contrast_hu, force=a.force,
         slab_mm=tuple(float(x) for x in a.slab.split(",")) if a.slab else None,

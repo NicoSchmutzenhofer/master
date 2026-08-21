@@ -57,6 +57,17 @@ EXPECT_INSERTS=18
 # outline in testing). Leave empty to fall back to automatic detection.
 # Auto-discovered as $WFBP_DIR/Segmentation.nrrd when left empty.
 SEGMENTATION=""
+# Label value of the segment marking the UNIFORM region the noise is measured in.
+# On this anthropomorphic phantom the body outline contains lung, bone and the table,
+# none of which are noise, so one extra segment is needed.  Draw it whichever way is
+# easiest -- all three are equivalent, verified:
+#   * trace the module's inner BOUNDARY only (the interior is filled automatically,
+#     and a boundary keeps Slicer's fill-between-slices clear of the inserts)
+#   * paint the module solid straight over the inserts (they keep priority)
+#   * paint it solid while avoiding them
+# Annotated inserts + a 6 mm margin are removed from it in every case.  The stage-0 log
+# prints the label values it found, so use that rather than guessing.
+BACKGROUND_LABEL=""
 
 PHANTOM_ARGS=""
 if [ -n "$PHANTOM_Z" ]; then
@@ -68,6 +79,9 @@ if [ -n "$EXPECT_INSERTS" ]; then
 fi
 if [ -n "$SEGMENTATION" ]; then
     PHANTOM_ARGS="$PHANTOM_ARGS --segmentation=$SEGMENTATION"
+fi
+if [ -n "$BACKGROUND_LABEL" ]; then
+    PHANTOM_ARGS="$PHANTOM_ARGS --background-label=$BACKGROUND_LABEL"
 fi
 
 source /opt/miniconda3/etc/profile.d/conda.sh
@@ -110,7 +124,7 @@ echo
 echo "=== done ==="
 echo "  QC (check these FIRST):"
 echo "    $OUT_ROOT/qc/stage0_slab_detection.png   slab must contain the inserts"
-echo "    $OUT_ROOT/qc/roi_own.png  roi_wfbp.png  roi_vmi.png"
+echo "    $OUT_ROOT/qc/roi_own.nrrd  roi_wfbp.nrrd  roi_vmi.nrrd   (load in Slicer ON TOP of the data)"
 echo "  Results:"
 echo "    $OUT_ROOT/figures/tradeoff_per_threshold.png   <- the headline figure"
 echo "    $OUT_ROOT/figures/nps_curves.png  vmi_vs_kev.png  bland_altman_own_vs_wfbp.png"

@@ -179,6 +179,7 @@ def test_slab_and_thickness(rng):
               f"detected k=[{sd['k_lo']},{sd['k_hi']}], truth [{k0},{k1}]")
 
     test_labelmap_seeded_inserts(rng)
+    test_noise_region(rng)
     test_slab_search_restriction(rng)
 
     native = rng.normal(0, 30.0, (100, 32, 32)).astype(np.float32)
@@ -293,6 +294,77 @@ def test_slab_search_restriction(rng):
     _chk_true("every candidate layer is reported",
               len(restricted["candidates"]) >= 2,
               f"{len(restricted['candidates'])} candidates")
+
+
+def test_noise_region(rng):
+    """
+    Where the noise is measured, on a phantom that is NOT uniform.
+
+    Pins two failures that each produced plausible-looking but wrong noise numbers:
+      * the body outline of an anthropomorphic phantom contains lung, bone and the table,
+        so a patch on any of them measures anatomy -- the real run reported 54-250 HU
+        "noise" with an f_av of 0.078 cyc/mm, i.e. a noise grain over a centimetre wide;
+      * selecting the flattest FRACTION of a uniform region keeps speckle rather than a
+        region, and the following erosion then destroyed it (1.4 % of a completely
+        uniform body survived), silently forcing the fallback to the body outline.
+    """
+    print("\n[9] noise region on a non-uniform phantom")
+    pix = 500.0 / 512
+    n = 512
+    yy, xx = np.mgrid[:n, :n]
+    cy, cx = n / 2 - 30, n / 2 - 0.5
+
+    # uniform phantom: the homogeneous region must survive essentially intact
+    uni = np.full((n, n), -1000.0)
+    uni[((yy - cy) ** 2 + (xx - cx) ** 2) <= (100 / pix) ** 2] = 0.0
+    uni = uni + rng.normal(0, 12.0, uni.shape)
+    body_u = iq.detect_body_mask(uni, pix)
+    homo_u = iq.homogeneous_mask(uni, body_u, pix)
+    _chk_true("uniform body is kept whole", homo_u.sum() > 0.6 * body_u.sum(),
+              f"kept {100 * homo_u.sum() / body_u.sum():.0f}% of the body")
+
+    # thorax phantom: lung, bone and table must all be rejected
+    thx = np.full((n, n), -1000.0)
+    thx[(((yy - cy) / (95 / pix)) ** 2 + ((xx - cx) / (150 / pix)) ** 2) <= 1.0] = 40.0
+    for sx in (-70, 70):
+        thx[(((yy - cy) / (60 / pix)) ** 2
+             + ((xx - cx - sx / pix) / (48 / pix)) ** 2) <= 1.0] = -800.0
+    thx[((yy - (cy + 70 / pix)) ** 2 + (xx - cx) ** 2) <= (18 / pix) ** 2] = 900.0
+    thx[(yy > cy + 110 / pix) & (yy < cy + 120 / pix)] = 700.0
+    truth_lung, truth_dense = thx < -400, thx > 400
+    thx_n = thx + rng.normal(0, 12.0, thx.shape)
+    body_t = iq.detect_body_mask(thx_n, pix)
+    homo_t = iq.homogeneous_mask(thx_n, body_t, pix)
+    _chk_true("lung and bone/table excluded",
+              not (homo_t & truth_lung).any() and not (homo_t & truth_dense).any(),
+              f"lung {int((homo_t & truth_lung).sum())} px, "
+              f"dense {int((homo_t & truth_dense).sum())} px, "
+              f"kept {100 * homo_t.sum() / body_t.sum():.0f}% of the body")
+
+    # an insert left inside the region is counted as noise
+    sd_true = 40.0
+    flat_img = np.full((n, n), -1000.0)
+    disc = ((yy - cy) ** 2 + (xx - cx) ** 2) <= (100 / pix) ** 2
+    flat_img[disc] = 0.0
+    ins = []
+    for j in range(6):
+        a = 2 * np.pi * j / 6
+        ty, tx = cy + 55 * np.sin(a) / pix, cx + 55 * np.cos(a) / pix
+        flat_img[((yy - ty) ** 2 + (xx - tx) ** 2) <= (9 / pix) ** 2] = 400.0
+        ins.append({"cy": ty, "cx": tx, "radius_px": 9 / pix, "radius_mm": 9.0})
+    vol = np.repeat(flat_img[None], 12, axis=0) + rng.normal(0, sd_true, (12, n, n))
+    body = iq.detect_body_mask(vol[6], pix)
+    with_ins, _ = iq.region_noise_sd(vol, iq.noise_region(body, [], pix))
+    without, _ = iq.region_noise_sd(vol, iq.noise_region(body, ins, pix))
+    _chk("noise with inserts excluded", without, sd_true, 0.05)
+    _chk_true("leaving inserts in inflates the noise", with_ins > without * 1.2,
+              f"{with_ins:.1f} HU with inserts vs {without:.1f} HU without "
+              f"(true {sd_true:.0f})")
+
+    # the SD must not depend on square patches fitting
+    sd_all, n_vox = iq.region_noise_sd(vol, iq.noise_region(body, ins, pix))
+    _chk_true("SD measured without any patch geometry", n_vox > 1000 and np.isfinite(sd_all),
+              f"{n_vox} voxels, sd={sd_all:.1f} HU")
 
 
 def main() -> int:
