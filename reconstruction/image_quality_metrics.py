@@ -126,6 +126,132 @@ def detect_inserts(img_hu, body_mask, pixel_mm,
     return out
 
 
+def refine_insert_geometry(img_hu, cy, cx, r_guess_px, search=2.5):
+    """
+    Refine one insert's centre and radius from the image, starting from a rough guess.
+
+    Made for hand-drawn seeds: a contour traced by eye has the right position but not
+    the right edge, and both the TTF (which needs the true centre to build a clean
+    radial edge profile) and the background exclusion (which needs the true radius) are
+    sensitive to that.  The seed only has to overlap the insert.
+
+    Method: estimate the inside and outside levels from the seed, threshold halfway
+    between them, take the connected component containing the seed for a robust centre,
+    then read the radius off the 50 % crossing of the radial profile about that centre --
+    which is sub-pixel and does not care how wobbly the drawn outline was.
+
+    Returns (cy, cx, radius_px, ok).  ok=False means the insert could not be separated
+    from its surroundings (too little contrast in this channel) and the seed geometry
+    was kept unchanged.
+    """
+    img = np.asarray(img_hu, dtype=np.float64)
+    ny, nx = img.shape
+    r = float(max(r_guess_px, 1.5))
+    half = int(np.ceil(search * r)) + 2
+    y0, y1 = max(0, int(cy) - half), min(ny, int(cy) + half + 1)
+    x0, x1 = max(0, int(cx) - half), min(nx, int(cx) + half + 1)
+    sub = img[y0:y1, x0:x1]
+    if sub.size < 16:
+        return float(cy), float(cx), r, False
+
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    inner = sub[rr < 0.5 * r]
+    outer = sub[(rr > 1.5 * r) & (rr < search * r)]
+    if inner.size < 4 or outer.size < 8:
+        return float(cy), float(cx), r, False
+    lo, hi = float(np.median(outer)), float(np.median(inner))
+    if abs(hi - lo) < 1e-6:
+        return float(cy), float(cx), r, False
+
+    mid = 0.5 * (lo + hi)
+    blob = (sub > mid) if hi > lo else (sub < mid)
+    blob = ndimage.binary_opening(blob, _disk(1))
+    lab, n = ndimage.label(blob)
+    if n == 0:
+        return float(cy), float(cx), r, False
+    seed = lab[int(round(cy)) - y0, int(round(cx)) - x0]
+    if seed == 0:                       # seed landed just off the insert -> nearest blob
+        cand = [(abs(ndimage.center_of_mass(lab == i)[0] + y0 - cy)
+                 + abs(ndimage.center_of_mass(lab == i)[1] + x0 - cx), i)
+                for i in range(1, n + 1)]
+        seed = min(cand)[1]
+    comp = lab == seed
+    ccy, ccx = ndimage.center_of_mass(comp)
+    ccy, ccx = float(ccy + y0), float(ccx + x0)
+    r_eq = float(np.sqrt(comp.sum() / np.pi))
+
+    # sub-pixel radius from the 50 % crossing about the refined centre
+    rr2 = np.sqrt((yy - ccy) ** 2 + (xx - ccx) ** 2)
+    dr = 0.25
+    nb = int(np.ceil(search * r / dr))
+    idx = np.clip((rr2 / dr).astype(int), 0, nb - 1)
+    cnt = np.bincount(idx.ravel(), minlength=nb)
+    tot = np.bincount(idx.ravel(), weights=sub.ravel(), minlength=nb)
+    ok_bins = cnt > 0
+    prof = np.full(nb, np.nan)
+    prof[ok_bins] = tot[ok_bins] / cnt[ok_bins]
+    radii = (np.arange(nb) + 0.5) * dr
+    good = np.isfinite(prof)
+    frac = (prof[good] - lo) / (hi - lo)
+    cross = _crossing(radii[good], frac, 0.5)
+    if np.isfinite(cross) and 0.3 * r <= cross <= search * r:
+        r_eq = float(cross)
+    return ccy, ccx, r_eq, True
+
+
+def inserts_from_labelmap(label_vol, img_hu, pixel_mm, refine=True,
+                          min_diameter_mm=3.0, max_diameter_mm=40.0):
+    """
+    Turn a hand-drawn label map into insert ROIs, with edges refined from the image.
+
+    Each label value is treated as a GROUP (e.g. one row of inserts drawn as a single
+    segment), so every label is split into its connected components first -- one ROI per
+    component, not one per label.  Labels need not cover every insert; whatever is drawn
+    is used, which is the point of allowing a partial annotation.
+
+    label_vol : integer labels on the SAME grid as img_hu (resample beforehand).
+    img_hu    : the 2-D image the ROIs will be measured on (use the slab z-average).
+    """
+    lab_in = np.asarray(label_vol)
+    if lab_in.ndim == 3:                    # collapse a 3-D segmentation onto the plane
+        lab_in = np.max(lab_in, axis=0)
+    img = np.asarray(img_hu, dtype=np.float32)
+    if lab_in.shape != img.shape:
+        raise ValueError(f"inserts_from_labelmap: label shape {lab_in.shape} != image "
+                         f"shape {img.shape} -- resample the segmentation first")
+
+    bg = float(np.median(img[lab_in == 0])) if np.any(lab_in == 0) else float(np.median(img))
+    out = []
+    for value in sorted(int(v) for v in np.unique(lab_in) if v > 0):
+        group = lab_in == value
+        comps, n = ndimage.label(group)
+        for i in range(1, n + 1):
+            comp = comps == i
+            area = int(comp.sum())
+            r_seed = np.sqrt(area / np.pi)
+            if not (min_diameter_mm / 2 <= r_seed * pixel_mm <= max_diameter_mm / 2):
+                continue
+            cy, cx = ndimage.center_of_mass(comp)
+            refined = False
+            r_px = r_seed
+            if refine:
+                cy, cx, r_px, refined = refine_insert_geometry(img, cy, cx, r_seed)
+            yy, xx = np.ogrid[:img.shape[0], :img.shape[1]]
+            disc = ((yy - cy) ** 2 + (xx - cx) ** 2) <= (r_px * 0.7) ** 2
+            mean_hu = float(img[disc].mean()) if disc.any() else float(img[comp].mean())
+            out.append({
+                "cy": float(cy), "cx": float(cx),
+                "radius_px": float(r_px), "radius_mm": float(r_px * pixel_mm),
+                "mean_hu": mean_hu, "contrast_hu": mean_hu - bg,
+                "circularity": 1.0, "area_px": area,
+                "label": value, "refined": bool(refined),
+                "seed_radius_mm": float(r_seed * pixel_mm),
+            })
+    out.sort(key=lambda d: (d["label"], d["cx"], d["cy"]))
+    return out
+
+
 def background_patches(body_mask, inserts, pixel_mm, patch_px=64,
                        insert_margin_mm=6.0, edge_margin_mm=10.0, max_patches=64):
     """
@@ -297,12 +423,15 @@ def noise_power_spectrum(volume, patches, pixel_mm, patch_px=64, slices=None,
     acc = np.zeros((p, p))
     n = 0
     var_acc = 0.0
+    patch_var = []
     for z in slices:
         sl = vol[z]
         for (y0, x0) in patches:
             sub = sl[y0:y0 + p, x0:x0 + p]
             d = _detrend_patch(sub, detrend_order)
-            var_acc += float(np.mean(d * d))
+            v = float(np.mean(d * d))
+            var_acc += v
+            patch_var.append(v)
             acc += np.abs(np.fft.fft2(d)) ** 2
             n += 1
     if n == 0:
@@ -322,6 +451,23 @@ def noise_power_spectrum(volume, patches, pixel_mm, patch_px=64, slices=None,
 
     df = 1.0 / (p * dx)
     variance_from_nps = float(nps2.sum() * df * df)
+
+    # Uniformity diagnostics, REPORTED BUT NOT THRESHOLDED.
+    #
+    # An insert that was never detected stays inside the background, inflating the noise
+    # SD and dragging f_av down (structure is low-frequency).  It is tempting to detect
+    # that from the patch statistics, but measurement shows it cannot be done reliably:
+    # with 16 of 18 inserts left in, the patch-mean spread rises to ~3.7x the white-noise
+    # expectation, while CLEAN but strongly correlated noise (an iteratively reconstructed
+    # or denoised image -- precisely what the vendor supplies) reaches ~14x. Any threshold
+    # separating them would false-alarm on the images the comparison is about.
+    #
+    # So these are context, not alarms.  The guard that actually works is structural:
+    # exclude every insert (supply a segmentation) and check the count against
+    # --expect-inserts, then confirm on qc/roi_*.png.
+    sd_patch = np.sqrt(np.asarray(patch_var, dtype=float))
+    lo_p, hi_p = np.percentile(sd_patch, [10, 90])
+    heterogeneity = float(hi_p / lo_p) if lo_p > 0 else float("inf")
     return {
         "nps_2d": np.fft.fftshift(nps2),
         "f_axis": np.fft.fftshift(fx),
@@ -333,6 +479,8 @@ def noise_power_spectrum(volume, patches, pixel_mm, patch_px=64, slices=None,
         "variance_measured": var_acc / n,
         "variance_from_nps": variance_from_nps,
         "noise_sd_hu": float(np.sqrt(var_acc / n)),
+        "patch_sd_p10": float(lo_p), "patch_sd_p90": float(hi_p),
+        "patch_heterogeneity": heterogeneity,
         **nps_summary(f, nps_r),
     }
 

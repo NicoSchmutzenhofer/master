@@ -50,6 +50,14 @@ OUT_ROOT="output/research/recon_comparison"
 PHANTOM_Z="-1515.5,-1408.3"
 EXPECT_INSERTS=18
 
+# --- hand-drawn insert prior (optional) -------------------------------------
+# A Slicer segmentation of the inserts. Positions only need to be roughly right and
+# a PARTIAL annotation is fine: each label is split into its individual inserts and
+# every edge is then refined from the image (~10x better radii than the drawn
+# outline in testing). Leave empty to fall back to automatic detection.
+# Auto-discovered as $WFBP_DIR/Segmentation.nrrd when left empty.
+SEGMENTATION=""
+
 PHANTOM_ARGS=""
 if [ -n "$PHANTOM_Z" ]; then
     # NOTE the = form: a value starting with "-" is otherwise taken as a flag
@@ -57,6 +65,9 @@ if [ -n "$PHANTOM_Z" ]; then
 fi
 if [ -n "$EXPECT_INSERTS" ]; then
     PHANTOM_ARGS="$PHANTOM_ARGS --expect-inserts=$EXPECT_INSERTS"
+fi
+if [ -n "$SEGMENTATION" ]; then
+    PHANTOM_ARGS="$PHANTOM_ARGS --segmentation=$SEGMENTATION"
 fi
 
 source /opt/miniconda3/etc/profile.d/conda.sh

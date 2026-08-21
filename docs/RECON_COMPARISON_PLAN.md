@@ -234,6 +234,27 @@ between its inserts. `auto_background_patches` halves the request until enough f
 NPS frequency grid depends on it and curves measured at different sizes are not
 comparable. The size actually used is logged and stored with the metrics.
 
+**A hand-drawn insert prior overrides automatic detection.** `--segmentation` takes a
+Slicer `.nrrd` / `.seg.nrrd` (auto-discovered as `<wfbp-dir>/Segmentation.nrrd`). It is a
+*seed*, not the answer: each label is treated as a GROUP — one label per row of inserts is
+the natural way to draw it — split into its connected components, and then **every edge is
+refined from the image**. The seed only has to overlap its insert; the refinement estimates
+the inside and outside levels, thresholds halfway between them, takes the component
+containing the seed for a robust centre, and reads the radius off the 50 % crossing of the
+radial profile. On deliberately sloppy seeds (centres off by up to 2.5 px, radii wrong by
+−35 % to +55 %) this recovers centres to <0.5 mm and cuts the radius error ~10×. That matters
+because the TTF needs the true centre to build a clean edge profile and the background
+exclusion needs the true radius. A **partial** annotation is fine — inserts that are not
+visible need not be drawn.
+
+Resampling is done in **physical space**, never by array index: a Slicer segmentation is
+normally cropped to the segment bounding box, so its extent and origin differ from the volume
+it was drawn on. This also carries the segmentation onto our own reconstruction, whose slab
+covers a different z range. If the resampled label map is **empty** for a family, that is
+reported as a finding rather than a nuisance: for `own` it means our helical z and the
+vendor's `ImagePositionPatient` z are not the same frame (see §9), and the family falls back
+to automatic detection.
+
 **ROI placement is automatic and must still be eyeballed.** Detection runs once per family on
 the **z-average** of the slab (√Z better SNR, and the inserts are z-invariant within the layer
 stage 0 selected), then the same ROIs are reused for every channel and variant of that family

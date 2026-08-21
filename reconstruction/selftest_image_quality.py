@@ -178,6 +178,7 @@ def test_slab_and_thickness(rng):
               abs(sd["k_lo"] - k0) <= 2 and abs(sd["k_hi"] - k1) <= 2,
               f"detected k=[{sd['k_lo']},{sd['k_hi']}], truth [{k0},{k1}]")
 
+    test_labelmap_seeded_inserts(rng)
     test_slab_search_restriction(rng)
 
     native = rng.normal(0, 30.0, (100, 32, 32)).astype(np.float32)
@@ -186,6 +187,54 @@ def test_slab_and_thickness(rng):
     _chk("thickness-matched noise = sd/sqrt(n)", float(matched.std()),
          30.0 / np.sqrt(np.mean(used)), 0.10)
     print(f"        averaged {np.mean(used):.1f} native slices per 2.0 mm slice")
+
+
+def test_labelmap_seeded_inserts(rng):
+    """
+    Hand-drawn seeds -> refined ROIs.
+
+    Mimics a Slicer segmentation: one label per ROW of inserts (so each label must be
+    split into components), positions roughly right but deliberately offset, and drawn
+    radii wrong by -35 % to +55 %.  The refinement has to recover the true geometry from
+    the image, because TTF needs the true centre and the background exclusion needs the
+    true radius.
+    """
+    print("\n[8] insert ROIs seeded from a hand-drawn label map")
+    pix = 500.0 / 512
+    n = 512
+    yy, xx = np.mgrid[:n, :n]
+    cy = cx = n / 2 - 0.5
+    img = np.full((n, n), -1000.0)
+    img[((yy - cy) ** 2 + (xx - cx) ** 2) <= (100 / pix) ** 2] = 0.0
+
+    r_true_mm = 6.0
+    truth, labels = [], np.zeros((n, n), dtype=np.int32)
+    for row, (dy, hu) in enumerate([(-45, 300.0), (0, 150.0), (45, -70.0)], start=1):
+        for dx in (-50, -20, 20, 50):
+            ty, tx = cy + dy / pix, cx + dx / pix
+            img[((yy - ty) ** 2 + (xx - tx) ** 2) <= (r_true_mm / pix) ** 2] = hu
+            truth.append((ty, tx))
+            oy, ox = rng.uniform(-2.5, 2.5, 2)          # sloppy centre
+            rs = (r_true_mm / pix) * rng.uniform(0.65, 1.55)   # sloppy radius
+            labels[((yy - (ty + oy)) ** 2 + (xx - (tx + ox)) ** 2) <= rs ** 2] = row
+    img = ndimage.gaussian_filter(img, 1.2) + rng.normal(0, 18.0, img.shape)
+
+    ins = iq.inserts_from_labelmap(labels, img, pix, refine=True)
+    _chk_true("row labels split into individual inserts", len(ins) == len(truth),
+              f"{len(ins)} ROIs from {len({i['label'] for i in ins})} labels, "
+              f"expected {len(truth)} from 3")
+    _chk_true("every edge refined", all(i["refined"] for i in ins),
+              f"{sum(i['refined'] for i in ins)}/{len(ins)}")
+
+    err = [min(np.hypot(i["cy"] - t[0], i["cx"] - t[1]) for t in truth) * pix for i in ins]
+    _chk_true("centres recovered to <0.5 mm", max(err) < 0.5,
+              f"mean {np.mean(err):.2f} mm, max {np.max(err):.2f} mm")
+
+    drawn = np.abs(np.array([i["seed_radius_mm"] for i in ins]) - r_true_mm).mean()
+    refined = np.abs(np.array([i["radius_mm"] for i in ins]) - r_true_mm).mean()
+    _chk_true("refinement beats the drawn radius by >5x", drawn / refined > 5,
+              f"drawn err {drawn:.2f} mm -> refined err {refined:.2f} mm "
+              f"({drawn / refined:.1f}x better)")
 
 
 def test_slab_search_restriction(rng):

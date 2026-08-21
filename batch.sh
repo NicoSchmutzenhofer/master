@@ -29,7 +29,19 @@ cd "$SLURM_SUBMIT_DIR"
 #   stanza below (drop --gres for a pure CPU slot if your scheduler allows).
 SOURCE="${1:-own}"
 export DECOMP_SOURCE="$SOURCE"
-echo "=== material decomposition: source=$SOURCE ==="
+shift 2>/dev/null || true      # remaining args are forwarded to decompose.py
+
+# --- Siemens export folders (edit these) ------------------------------------
+# Each Siemens reconstruction lives in its OWN folder, so wfbp and vmi need separate
+# paths -- one path cannot serve both.  Point each at a folder holding exactly ONE
+# reconstruction: a parent holding several sets yields duplicate channel labels
+# (T1,T1,T2,T2,...) and is rejected.  To see what is where:
+#   python -m decomposition.decompose --list-series '/data/.../export'
+WFBP_DIR="/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/Thx.- Abdomen Staging_Standard - PNR_20260729_124048/"
+VMI_DIR="/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/Thx.- Abdomen Staging_Standard - PNR_20260729_092611/"
+MODE="phantom_ca_i"            # python -m decomposition.decompose --list-modes
+
+echo "=== material decomposition: source=$SOURCE  mode=$MODE ==="
 
 # --- (optional) (re)build our per-threshold volumes first; needs the GPU. Skip for vmi/wfbp,
 #     or if output/reconstruction/reconstruction_thr_{A,B,C,D}_HU.nii.gz already exist. ---
@@ -37,7 +49,12 @@ echo "=== material decomposition: source=$SOURCE ==="
 
 # self-test (math sanity) -> decompose the chosen source (stops on first error)
 python -m decomposition.selftest_decomposition \
-  && python -m decomposition.decompose
+  && python -m decomposition.decompose \
+        --source "$SOURCE" \
+        --mode "$MODE" \
+        --wfbp-dir "$WFBP_DIR" \
+        --vmi-dir  "$VMI_DIR" \
+        "$@"
 
 # --- (optional) research ablations on our own recon (source-independent; needs the NIfTI volumes) ---
 # python -m decomposition.research_decomposition

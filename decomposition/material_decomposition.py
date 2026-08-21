@@ -1014,6 +1014,20 @@ def load_siemens_energy_stack(config: DecompConfig, kind: str):
 
     found.sort(key=lambda t: t[0])
     channels = [c for _, c, _, _ in found]
+
+    # A Siemens export puts each reconstruction in its own folder, and build_dicom_index
+    # walks recursively.  Pointed at a PARENT holding several sets, every set matches and
+    # they are concatenated into one oversized stack with repeated labels (T1,T1,T2,T2,...)
+    # -- which decomposes without complaint and is silently wrong.  Refuse instead.
+    labels = [c.label for c in channels]
+    if len(set(labels)) != len(labels):
+        dupes = sorted({l for l in labels if labels.count(l) > 1})
+        raise ValueError(
+            f"{kind}: duplicate channel labels {dupes} under {folder} -- that folder holds "
+            f"more than one {kind} reconstruction. Point the input at the specific series "
+            f"folder. To see what is where:\n"
+            f"  python -m decomposition.decompose --list-series '{folder}'")
+
     logger.info("Siemens %s: %d channels %s", kind, len(channels), [c.label for c in channels])
 
     vols, ref = None, None

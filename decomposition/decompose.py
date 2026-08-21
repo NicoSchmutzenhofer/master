@@ -19,11 +19,19 @@ per-material RELIABILITY block (printed to stdout and stored in metadata) flags 
 likely degenerate -- especially useful for VMI, where a 3-material solve is near-degenerate until
 the low-keV (K-edge-straddling) VMIs are available.
 
-Run from the repo root:
-    python -m decomposition.decompose
+Run from the repo root (every constant below is only a default -- see --help):
+    python -m decomposition.decompose --source own
+    python -m decomposition.decompose --source wfbp --wfbp-dir '/data/.../PNR_..._124048'
+    python -m decomposition.decompose --source vmi  --vmi-dir  '/data/.../PNR_..._092611'
+    python -m decomposition.decompose --list-series /data/.../export   # what is where
+    python -m decomposition.decompose --list-modes
+Outputs go to output/decomposition/<source>/<mode>/ and each run stores the
+configuration that produced it (decomp_config.json).
 """
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
 from pathlib import Path
@@ -50,12 +58,21 @@ WATER_CALIBRATION = False     # baseline: physical per-channel mu_water, no per-
 
 # --- input locations -------------------------------------------------------------
 OWN_DIR = str(_REPO_ROOT / "output" / "reconstruction")     # our NIfTI recon (INPUT_SOURCE='own')
-# Siemens DICOM export root (holds the Mono_* and WFBP_T* series folders); used for 'wfbp'/'vmi'.
-SIEMENS_DIR = "/data/Data2/4_BIN_PCCT/Reconstructions/4-bin_Phantom-Scan/Thx.- Abdomen Staging_Standard - PNR_20260715_151401"
+# Siemens DICOM export folders.  WFBP and VMI are SEPARATE arguments because a Siemens
+# export puts each reconstruction in its own folder -- one path cannot serve both, and a
+# parent folder holding several sets would concatenate their channels into one stack.
+# Point each at the folder holding exactly ONE reconstruction; use --list-series to check.
+WFBP_DIR = ""                 # e.g. ".../Thx.- Abdomen Staging_Standard - PNR_20260729_124048"
+VMI_DIR = ""                  # e.g. ".../Thx.- Abdomen Staging_Standard - PNR_20260729_092611"
 Z_SLAB_MM = None              # (z_lo, z_hi) mm to restrict to a slab; None = full volume
 
-OUTPUT_ROOT = str(_REPO_ROOT / "output" / "decomposition")  # per-source subfolder added below
+OUTPUT_ROOT = str(_REPO_ROOT / "output" / "decomposition")  # <source>/<mode>/ added below
 # ====================================================================
+#
+# Every constant above is only a DEFAULT: the CLI below overrides each of them, so a run
+# never requires editing this file.  `python -m decomposition.decompose --help` is the
+# authoritative list, and each run records the exact configuration that produced it
+# (decomp_config.json) -- which is what the thesis promises in sec:bg-software.
 
 
 def _print_stability(result) -> None:
@@ -79,22 +96,119 @@ def _print_stability(result) -> None:
     print("=" * 66)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    from decomposition.decomposition_modes import list_modes
+
+    p = argparse.ArgumentParser(
+        prog="python -m decomposition.decompose",
+        description="Image-domain material decomposition over our reconstruction, "
+                    "Siemens WFBP thresholds, or Siemens VMIs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--source", default=INPUT_SOURCE, choices=["own", "wfbp", "vmi"],
+                   help="input family (env DECOMP_SOURCE sets the default)")
+    p.add_argument("--mode", default=MODE,
+                   help=f"clinical mode -> basis materials. Available: {', '.join(list_modes())}")
+    p.add_argument("--own-dir", default=OWN_DIR,
+                   help="folder of our reconstruction_thr_*_HU.nii.gz")
+    p.add_argument("--wfbp-dir", default=WFBP_DIR or None,
+                   help="folder holding ONE Siemens WFBP threshold reconstruction")
+    p.add_argument("--vmi-dir", default=VMI_DIR or None,
+                   help="folder holding ONE Siemens monoenergetic (VMI) reconstruction")
+    p.add_argument("--estimator", default=ESTIMATOR,
+                   choices=["ols", "wls", "wls_denoise", "wls_joint"])
+    p.add_argument("--noise-model", default=NOISE_MODEL, choices=["global", "spatial"])
+    p.add_argument("--bin-domain", default=BIN_DOMAIN,
+                   choices=["cumulative", "exclusive"],
+                   help="thresholds only; VMI is forced to 'direct'")
+    p.add_argument("--threshold-option", type=int, default=THRESHOLD_OPTION,
+                   help="threshold window set for own/wfbp (VMI ignores it)")
+    p.add_argument("--water-calibration", dest="water_calibration", action="store_true",
+                   default=WATER_CALIBRATION)
+    p.add_argument("--no-water-calibration", dest="water_calibration",
+                   action="store_false")
+    p.add_argument("--z-slab", metavar="LO,HI",
+                   help="restrict to an axial slab in mm. Write it as --z-slab=-1515,-1408 "
+                        "-- a value starting with '-' is otherwise parsed as a flag")
+    p.add_argument("--output-root", default=OUTPUT_ROOT,
+                   help="outputs go to <output-root>/<source>/<mode>/")
+    p.add_argument("--config", metavar="FILE",
+                   help="load a previously written decomp_config.json; explicit flags "
+                        "still win over it")
+    p.add_argument("--list-modes", action="store_true",
+                   help="print the available clinical modes and exit")
+    p.add_argument("--list-series", metavar="DIR",
+                   help="print every DICOM series under DIR with its classification and "
+                        "exit -- use it to find the right --wfbp-dir/--vmi-dir")
+    return p
+
+
+def _list_series(folder: str) -> None:
+    from decomposition.material_decomposition import build_dicom_index, _classify_series
+
+    index = build_dicom_index(folder)
+    print(f"\n{len(index)} series under {folder}\n")
+    print(f"{'#':>5s} {'files':>6s} {'class':<14s} description")
+    print("-" * 78)
+    for _uid, s in sorted(index.items(), key=lambda kv: str(kv[1].get("number"))):
+        spec = _classify_series(s.get("desc", ""),
+                                s["files"][0][1] if s["files"] else "")
+        cls = f"{spec[0]}:{spec[1]:g}" if spec else "-"
+        print(f"{str(s['number']):>5s} {len(s['files']):>6d} {cls:<14s} {s.get('desc', '')}")
+    print("\nPass the folder holding exactly ONE reconstruction: several sets under one "
+          "parent\nproduce duplicate channel labels and are rejected.")
+
+
+def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    src = INPUT_SOURCE.lower()
-    if src not in ("own", "wfbp", "vmi"):
-        raise ValueError(f"INPUT_SOURCE must be 'own'|'wfbp'|'vmi' (got {INPUT_SOURCE!r})")
+    args = build_parser().parse_args(argv)
+
+    if args.list_modes:
+        from decomposition.decomposition_modes import MODES
+        for key, spec in MODES.items():
+            print(f"  {key:22s} {spec.display_name:32s} {'/'.join(spec.materials)}")
+        return
+    if args.list_series:
+        _list_series(args.list_series)
+        return
+
+    overrides = {}
+    if args.config:
+        overrides = json.loads(Path(args.config).read_text(encoding="utf-8"))
+
+    src = args.source.lower()
+    dicom_dir = args.wfbp_dir if src == "wfbp" else args.vmi_dir
+    if src in ("wfbp", "vmi") and not dicom_dir:
+        raise SystemExit(
+            f"--source {src} needs --{src}-dir (the folder holding that one Siemens "
+            f"reconstruction).\nFind it with:\n"
+            f"  python -m decomposition.decompose --list-series /path/to/export")
+
+    z_slab = (tuple(float(v) for v in args.z_slab.split(",")) if args.z_slab
+              else Z_SLAB_MM)
 
     cfg = DecompConfig(
-        mode=MODE, threshold_option=THRESHOLD_OPTION, bin_domain=BIN_DOMAIN,
-        estimator=ESTIMATOR, noise_model=NOISE_MODEL, water_calibration=WATER_CALIBRATION,
+        mode=args.mode, threshold_option=args.threshold_option,
+        bin_domain=args.bin_domain, estimator=args.estimator,
+        noise_model=args.noise_model, water_calibration=args.water_calibration,
         input_source=src,
         input_format=("nifti" if src == "own" else "dicom"),
-        input_dir=OWN_DIR, dicom_dir=SIEMENS_DIR, z_slab_mm=Z_SLAB_MM,
-        output_dir=str(Path(OUTPUT_ROOT) / src),
+        input_dir=args.own_dir, dicom_dir=dicom_dir, z_slab_mm=z_slab,
+        # <source>/<mode>/ so own/wfbp/vmi and different clinical questions never
+        # overwrite one another -- the comparison tables need them side by side.
+        output_dir=str(Path(args.output_root) / src / args.mode),
     )
+    if overrides:                       # --config first, explicit flags already applied
+        merged = {**overrides, **{k: v for k, v in cfg.to_dict().items()
+                                  if v is not None}}
+        cfg = DecompConfig.from_dict(merged)
+
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.output_dir, "decomp_config.json").write_text(
+        json.dumps(cfg.to_dict(), indent=2, default=str), encoding="utf-8")
 
     print(f"=== material decomposition   source='{src}'   mode='{cfg.mode}'   estimator='{cfg.estimator}' ===")
+    if dicom_dir:
+        print(f"  input: {dicom_dir}")
     volumes, channels, ref = load_energy_stack(cfg)
     print(f"  loaded {len(channels)} channels {[c.label for c in channels]}  volumes {tuple(volumes.shape)}")
 

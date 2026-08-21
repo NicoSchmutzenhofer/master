@@ -146,6 +146,10 @@ class CompareConfig:
     # Metric parameters
     nps_patch_px: int = 64          # requested; reduced automatically if it does not fit
     insert_mad_k: float = 4.0       # lower = detect fainter inserts (more false positives)
+    # Hand-drawn insert prior (Slicer .nrrd / .seg.nrrd).  Positions only need to be
+    # roughly right: every edge is refined from the image, and a partial annotation is
+    # fine.  Auto-discovered as <wfbp_dir>/Segmentation.nrrd when not given.
+    segmentation: Optional[str] = None
     task_diameter_mm: float = 5.0
     task_contrast_hu: float = 50.0
     bias_smooth_mm: float = 5.0
@@ -162,6 +166,42 @@ class CompareConfig:
 def _sitk():
     import SimpleITK as sitk
     return sitk
+
+
+def load_segmentation(path, ref_img):
+    """
+    Read a Slicer segmentation and resample it onto `ref_img`'s grid.
+
+    Resampling is done in PHYSICAL space (nearest-neighbour), never by array index: a
+    Slicer .seg.nrrd is normally cropped to the segment bounding box, so its extent and
+    origin differ from the volume it was drawn on, and index-space alignment would be
+    silently wrong.  This also maps the segmentation onto our own reconstruction, whose
+    slab covers a different z range from the vendor series it was drawn on.
+
+    A .seg.nrrd may store each segment as a separate binary layer in a 4-D array; those
+    are merged into one label map (layer i -> label i+1).
+
+    Returns an integer label array shaped like ref_img, or None if nothing overlaps.
+    """
+    sitk = _sitk()
+    seg = sitk.ReadImage(str(path))
+    layers = ([seg[:, :, :, i] for i in range(seg.GetSize()[3])]
+              if seg.GetDimension() == 4 else [seg])
+
+    merged = None
+    for i, layer in enumerate(layers):
+        r = sitk.Resample(layer, ref_img, sitk.Transform(), sitk.sitkNearestNeighbor,
+                          0, sitk.sitkUInt16)
+        a = sitk.GetArrayFromImage(r).astype(np.int32)
+        if merged is None:
+            merged = np.zeros_like(a)
+        if len(layers) == 1:
+            merged = a                       # already a label map with distinct values
+        else:
+            merged[a > 0] = i + 1
+    if merged is None or not np.any(merged > 0):
+        return None
+    return merged
 
 
 def _load_match(out_root):
@@ -459,8 +499,29 @@ def stage0_probe(cfg: CompareConfig):
 
     z_lo = slab["z_lo_mm"] - cfg.slab_pad_mm
     z_hi = slab["z_hi_mm"] + cfg.slab_pad_mm
+    slab_source = f"structure score ({cfg.slab_select})"
+
+    # A segmentation knows where the inserts are far better than any structure score can
+    # infer it, so when one is supplied it defines the slab.  This matters when the score
+    # is flat -- inserts that run as rods along z produce no distinguishable "layer", and
+    # the score then spans the whole phantom and gets blindly trimmed to its middle.
+    if cfg.segmentation and cfg.use_phantom_z is not False:
+        labels = load_segmentation(cfg.segmentation, img)
+        if labels is None:
+            logger.warning("segmentation %s does not overlap the reference volume -- "
+                           "keeping the detected slab", cfg.segmentation)
+        else:
+            kz = np.where(labels.reshape(labels.shape[0], -1).any(axis=1))[0]
+            z_lo = float(zpos[kz].min()) - cfg.slab_pad_mm
+            z_hi = float(zpos[kz].max()) + cfg.slab_pad_mm
+            slab_source = f"segmentation ({Path(cfg.segmentation).name})"
+            logger.info("slab taken from the segmentation: z = %.2f .. %.2f mm "
+                        "(%d annotated slices, labels %s)", z_lo, z_hi, kz.size,
+                        sorted(int(v) for v in np.unique(labels) if v > 0))
+
     if cfg.slab_mm is not None:
         z_lo, z_hi = sorted(cfg.slab_mm)
+        slab_source = "--slab"
         logger.info("slab overridden by --slab: %.2f .. %.2f mm", z_lo, z_hi)
     elif (z_hi - z_lo) > cfg.max_slab_mm:                 # keep the GPU sweep affordable
         mid = 0.5 * (z_lo + z_hi)
@@ -715,6 +776,7 @@ def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patc
     res["nps_f"] = nps["f"]
     res["nps"] = nps["nps"]
     res["n_patches"] = nps["n_patches"]
+    res["patch_heterogeneity"] = nps["patch_heterogeneity"]
 
     flat = vol.mean(axis=0)
     best = None
@@ -743,7 +805,8 @@ def _measure_volume(vol, pixel_mm, rois, cfg: CompareConfig, body, patches, patc
     return res
 
 
-def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch_px=None):
+def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch_px=None,
+                 ref_img=None):
     """
     Detect body/inserts/background patches ONCE per family, then reuse for every channel
     and variant of that family, so a metric difference can never come from the ROIs
@@ -758,8 +821,33 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
     """
     flat = vol_ref.mean(axis=0)
     body = iq.detect_body_mask(flat, pixel_mm)
-    inserts = iq.detect_inserts(flat, body, pixel_mm,
-                                contrast_mad_k=cfg.insert_mad_k)
+
+    inserts, source = [], "auto"
+    seg_path = cfg.segmentation
+    if seg_path and ref_img is not None:
+        labels = load_segmentation(seg_path, ref_img)
+        if labels is None:
+            # Empty overlap is itself a finding: the segmentation was drawn on the vendor
+            # volume, so if it maps nowhere onto ours the two z frames disagree.
+            logger.warning("  %s: the segmentation does not overlap this volume at all. "
+                           "For 'own' that means our helical z and the vendor's "
+                           "ImagePositionPatient z are NOT the same frame. Falling back "
+                           "to automatic detection for this family.", tag)
+        else:
+            inserts = iq.inserts_from_labelmap(labels, flat, pixel_mm, refine=True)
+            source = f"segmentation ({Path(seg_path).name})"
+            n_ref = sum(1 for i in inserts if i["refined"])
+            logger.info("  %s: %d seeded ROIs from %d labels, %d edges refined from the "
+                        "image", tag, len(inserts),
+                        len({i["label"] for i in inserts}), n_ref)
+            for i in inserts:
+                if not i["refined"]:
+                    logger.warning("      label %s ROI at (%.0f,%.0f): too little contrast "
+                                   "to refine, kept the drawn outline (r=%.1f mm)",
+                                   i["label"], i["cy"], i["cx"], i["radius_mm"])
+    if not inserts:
+        inserts = iq.detect_inserts(flat, body, pixel_mm,
+                                    contrast_mad_k=cfg.insert_mad_k)
 
     if force_patch_px:
         # Every family must share one patch size: the NPS frequency grid depends on it,
@@ -779,9 +867,9 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
                         ", ".join(f"{s}px->{n}" for s, n in tried))
 
     body_px = int(body.sum())
-    logger.info("  %s: body %d px (%.0f mm2), %d inserts, %d NPS patches of %d px (%.1f mm)",
-                tag, body_px, body_px * pixel_mm ** 2, len(inserts), len(patches),
-                patch_px, patch_px * pixel_mm)
+    logger.info("  %s: body %d px (%.0f mm2), %d inserts [%s], %d NPS patches of "
+                "%d px (%.1f mm)", tag, body_px, body_px * pixel_mm ** 2, len(inserts),
+                source, len(patches), patch_px, patch_px * pixel_mm)
     for i, ins in enumerate(inserts):
         logger.info("      insert %d: r=%.1f mm  %+.0f HU vs background  circularity %.2f",
                     i, ins["radius_mm"], ins["contrast_hu"], ins["circularity"])
@@ -789,15 +877,17 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
         logger.warning("  %s: no inserts detected -- TTF/NEQ/d' unavailable, and the "
                        "background is not insert-excluded. Check qc/roi_%s.png", tag, tag)
     elif cfg.expect_inserts and len(inserts) != cfg.expect_inserts:
-        logger.warning("  %s: found %d inserts but %d were expected. Undetected inserts "
-                       "stay INSIDE the background region and inflate the noise estimate, "
-                       "so this matters beyond TTF. Try a lower --insert-mad-k, or a "
-                       "different layer via --slab; check qc/roi_%s.png.",
+        logger.warning("  %s: found %d inserts but %d were expected. THE NOISE NUMBERS "
+                       "FOR THIS FAMILY ARE NOT VALID: every missing insert stays inside "
+                       "the background region, inflating the noise SD and dragging f_av "
+                       "down. Supply --segmentation, or lower --insert-mad-k, then "
+                       "confirm on qc/roi_%s.png before using any of it.",
                        tag, len(inserts), cfg.expect_inserts, tag)
 
     # Written BEFORE any failure: when detection goes wrong the overlay is the only way
     # to see why, so it must exist even on the unhappy path.
-    _qc_roi_figure(qc_dir / f"roi_{tag}.png", flat, body, inserts, patches, patch_px, tag)
+    _qc_roi_figure(qc_dir / f"roi_{tag}.png", flat, body, inserts, patches, patch_px,
+                   f"{tag}  (ROIs: {source})")
 
     if not patches:
         raise ValueError(
@@ -860,10 +950,11 @@ def stage2_metrics(cfg: CompareConfig):
             p = vdir / f"reconstruction_thr_{label}_HU.nii.gz"
             if not p.exists():
                 continue
-            vol = sitk.GetArrayFromImage(sitk.ReadImage(str(p))).astype(np.float32)
+            img_own = sitk.ReadImage(str(p))
+            vol = sitk.GetArrayFromImage(img_own).astype(np.float32)
             pixel_mm = match["pixel_mm"]
             if own_ctx is None:      # detect once, reuse for every variant/threshold
-                own_ctx = _family_rois(vol, pixel_mm, cfg, "own", qc)
+                own_ctx = _family_rois(vol, pixel_mm, cfg, "own", qc, ref_img=img_own)
                 shared_patch_px = own_ctx[3]
             body, inserts, patches, patch_px = own_ctx
             logger.info("own/%s thr %s", v["name"], label)
@@ -884,7 +975,7 @@ def stage2_metrics(cfg: CompareConfig):
             pixel_mm = float(img.GetSpacing()[0])
             if ctx is None:
                 ctx = _family_rois(vol, pixel_mm, cfg, kind, qc,
-                                   force_patch_px=shared_patch_px)
+                                   force_patch_px=shared_patch_px, ref_img=img)
                 if shared_patch_px is None:
                     shared_patch_px = ctx[3]
             body, inserts, patches, patch_px = ctx
@@ -1004,8 +1095,12 @@ def _figures(cfg, out, res, match):
             ax.set_ylabel("noise SD in background (HU)   →  noisier")
         ax.set_title(f"threshold {label}  /  WFBP T{j + 1}")
         ax.grid(alpha=0.3)
-        if j == 0:
+        if j == 0 and ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=8)
+        elif j == 0:
+            ax.text(0.5, 0.5, "no TTF available\n(no insert edge measured)",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=9,
+                    color="tab:red")
     fig.suptitle("Noise-resolution trade-off, per energy channel  "
                  "(below/left = better; the vendor's position relative to our curve "
                  "is the result)")
@@ -1170,6 +1265,11 @@ def build_parser():
     p.add_argument("--nps-patch-px", type=int, default=64,
                    help="requested NPS patch size; halved automatically until it fits "
                         "the phantom, and the chosen size is shared by all families")
+    p.add_argument("--segmentation", metavar="FILE",
+                   help="hand-drawn insert prior (Slicer .nrrd/.seg.nrrd). Positions "
+                        "only need to be roughly right - every edge is refined from "
+                        "the image, and a partial annotation is fine. Defaults to "
+                        "<wfbp-dir>/Segmentation.nrrd if that exists")
     p.add_argument("--insert-mad-k", type=float, default=4.0,
                    help="insert-detection sensitivity in robust SDs; lower finds "
                         "fainter inserts. Check qc/roi_*.png after changing it")
@@ -1217,6 +1317,7 @@ def main(argv=None):
         data_path=a.data_path, desc_path=a.desc_path, geo_dir=a.geo_dir,
         n_pixels=a.n_pixels, fov_mm=a.fov_mm, max_slab_mm=a.max_slab_mm,
         nps_patch_px=a.nps_patch_px, insert_mad_k=a.insert_mad_k,
+        segmentation=a.segmentation,
         task_diameter_mm=a.task_diameter_mm,
         task_contrast_hu=a.task_contrast_hu, force=a.force,
         slab_mm=tuple(float(x) for x in a.slab.split(",")) if a.slab else None,
@@ -1231,6 +1332,17 @@ def main(argv=None):
         if not cfg.variants:
             raise SystemExit(f"no variants matched {sorted(want)}; available: "
                              f"{[v['name'] for v in DEFAULT_VARIANTS]}")
+
+    if not cfg.segmentation and cfg.wfbp_dir:
+        for name in ("Segmentation.nrrd", "Segmentation.seg.nrrd"):
+            cand = Path(cfg.wfbp_dir) / name
+            if cand.exists():
+                cfg.segmentation = str(cand)
+                logger.info("using the segmentation found next to the WFBP data: %s",
+                            cand)
+                break
+    if cfg.segmentation and not Path(cfg.segmentation).exists():
+        raise SystemExit(f"--segmentation {cfg.segmentation} does not exist")
 
     Path(cfg.out_root).mkdir(parents=True, exist_ok=True)
     _write_json(Path(cfg.out_root) / "compare_config.json", cfg.to_dict())
