@@ -287,6 +287,14 @@ material — where the ranking is pure chance — the survivors are speckle, whi
 following erosion destroys (measured: 1.4 % of a completely uniform body surviving a "keep
 the flattest 50 %" rule, which then silently forced the fallback to the body outline).
 
+**One segmentation serves all three families.** It is resampled onto each family's own
+grid in physical space, so a different slice spacing or pixel size between the WFBP and VMI
+exports transfers without trouble. The *metrics* are a different matter, and stage 0 now
+prints each family's geometry against the reference and warns on a mismatch: slice thickness
+changes the noise as ~1/√t for reasons unrelated to the reconstruction, and a different pixel
+size means the NPS frequency axes of the two families do not align. Neither invalidates the
+within-family comparison; both must be stated before comparing across families.
+
 **ROI placement is automatic and must still be eyeballed.** Detection runs once per family on
 the **z-average** of the slab (√Z better SNR, and the inserts are z-invariant within the layer
 stage 0 selected), then the same ROIs are reused for every channel and variant of that family

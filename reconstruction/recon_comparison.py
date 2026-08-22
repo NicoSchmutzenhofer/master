@@ -481,6 +481,33 @@ def stage0_probe(cfg: CompareConfig):
                     "sweep reproduces both, so the z-correlation matches too",
                     spacing, thickness)
 
+    # Every family is compared against the reference geometry.  A segmentation transfers
+    # across a spacing difference without trouble (it is resampled in physical space), but
+    # the METRICS do not: slice thickness and pixel size both change the measured noise for
+    # reasons that have nothing to do with the reconstruction, so a mismatch has to be
+    # named rather than quietly folded into the result.
+    logger.info("family geometry (reference = %s/%s):", ref_kind, ref["label"])
+    for kind, chans in families.items():
+        for c in chans:
+            t_c = c["thickness_mm"] or float("nan")
+            p_c = c["pixel_mm"] or float("nan")
+            s_c = c["spacing_between_mm"] or float("nan")
+            flags = []
+            if np.isfinite(t_c) and abs(t_c - thickness) > 0.01:
+                # noise ~ 1/sqrt(thickness): a thicker slice is quieter for free
+                flags.append(f"thickness {t_c:.2f} vs {thickness:.2f} mm -> expect its "
+                             f"noise to differ by ~{np.sqrt(thickness / t_c):.2f}x on that "
+                             f"account ALONE")
+            if np.isfinite(p_c) and abs(p_c - pixel_mm) > 1e-4:
+                flags.append(f"pixel {p_c:.4f} vs {pixel_mm:.4f} mm -> its NPS frequency "
+                             f"axis does not align with the reference; compare NPS curves "
+                             f"between these two families with care")
+            logger.info("   %-5s %-8s thickness %.2f  spacing %.2f  pixel %.4f  %s",
+                        kind, c["label"], t_c, s_c, p_c,
+                        "OK" if not flags else "MISMATCH")
+            for f in flags:
+                logger.warning("       %s: %s", c["label"], f)
+
     # Locate the insert layer on the reference volume (CPU, no GPU needed).
     # Reading is limited to the phantom when known: a Thx-Abdomen series is thousands of
     # slices, and the whole point of the restriction is that the rest of the scan range
@@ -879,7 +906,16 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
                            "ImagePositionPatient z are NOT the same frame. Falling back "
                            "to automatic detection for this family.", tag)
         else:
-            if cfg.background_label:
+            present = sorted(int(v) for v in np.unique(labels) if v > 0)
+            logger.info("  %s: segmentation labels present: %s", tag, present)
+            if cfg.background_label and int(cfg.background_label) not in present:
+                # Ignoring a wrong value silently would leave the background segment being
+                # measured as an insert and the noise measured somewhere else entirely.
+                logger.warning("  %s: --background-label %s is NOT in the segmentation "
+                               "(labels present: %s). Falling back to automatic background "
+                               "detection -- set the value that actually appears above.",
+                               tag, cfg.background_label, present)
+            elif cfg.background_label:
                 # One drawn segment marks the uniform region the noise is measured in.
                 # It must NOT also be treated as an insert.
                 drawn = np.any(labels == int(cfg.background_label), axis=0)
@@ -965,19 +1001,20 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
                     i, ins["radius_mm"], ins["contrast_hu"], ins["circularity"])
     if not inserts:
         logger.warning("  %s: no inserts detected -- TTF/NEQ/d' unavailable, and the "
-                       "background is not insert-excluded. Check qc/roi_%s.png", tag, tag)
+                       "background is not insert-excluded. Check qc/roi_%s.nrrd", tag, tag)
     elif cfg.expect_inserts and len(inserts) != cfg.expect_inserts:
         logger.warning("  %s: found %d inserts but %d were expected. THE NOISE NUMBERS "
                        "FOR THIS FAMILY ARE NOT VALID: every missing insert stays inside "
                        "the background region, inflating the noise SD and dragging f_av "
                        "down. Supply --segmentation, or lower --insert-mad-k, then "
-                       "confirm on qc/roi_%s.png before using any of it.",
+                       "confirm on qc/roi_%s.nrrd before using any of it.",
                        tag, len(inserts), cfg.expect_inserts, tag)
 
     # Written BEFORE any failure: when detection goes wrong the overlay is the only way
     # to see why, so it must exist even on the unhappy path.
     _qc_roi_volume(Path(qc_dir) / f"roi_{tag}.nrrd", vol_ref.shape[0], flat.shape, ref_img,
-                   body, inserts, patches, patch_px, tag, source)
+                   body, inserts, patches, patch_px, tag, source,
+                   region=region, region_src=region_src)
 
     if not patches:
         logger.warning(
@@ -989,7 +1026,7 @@ def _family_rois(vol_ref, pixel_mm, cfg: CompareConfig, tag, qc_dir, force_patch
 
 
 def _qc_roi_volume(path, n_slices, shape_yx, ref_img, body, inserts, patches, patch_px,
-                   tag, source):
+                   tag, source, region=None, region_src=""):
     """
     Write the ROI placement as a 3-D LABEL VOLUME, loadable straight into Slicer on top
     of the data, instead of a single-slice picture.
@@ -1009,16 +1046,22 @@ def _qc_roi_volume(path, n_slices, shape_yx, ref_img, body, inserts, patches, pa
     sitk = _sitk()
     ny, nx = shape_yx
     plane = np.zeros((ny, nx), dtype=np.uint16)
+    # 1 = the whole region accepted as uniform (what the noise SD is measured over),
+    # 2 = the square blocks inside it that the NPS could actually use.  Showing only the
+    # blocks hides the more important question -- was the right MATERIAL accepted at all.
+    if region is not None:
+        plane[np.asarray(region, dtype=bool)] = 1
     for (y0, x0) in patches:
-        plane[y0:y0 + patch_px, x0:x0 + patch_px] = 1
+        plane[y0:y0 + patch_px, x0:x0 + patch_px] = 2
     yy, xx = np.ogrid[:ny, :nx]
-    legend = {"1": "NPS background patches"}
+    legend = {"1": "noise region (SD measured here)",
+              "2": "NPS patches (FFT blocks inside the region)"}
     for i, ins in enumerate(inserts):
         disc = ((yy - ins["cy"]) ** 2 + (xx - ins["cx"]) ** 2) <= ins["radius_px"] ** 2
-        plane[disc] = 2 + i          # inserts win over patches so overlap is visible
-        legend[str(2 + i)] = (f"insert {i}  r={ins['radius_mm']:.2f} mm  "
-                              f"{ins.get('contrast_hu', float('nan')):+.0f} HU"
-                              + ("  [refined]" if ins.get("refined") else ""))
+        plane[disc] = 10 + i         # inserts win, so any overlap is immediately visible
+        legend[str(10 + i)] = (f"insert {i}  r={ins['radius_mm']:.2f} mm  "
+                               f"{ins.get('contrast_hu', float('nan')):+.0f} HU"
+                               + ("  [refined]" if ins.get("refined") else ""))
 
     vol = np.repeat(plane[None], max(1, int(n_slices)), axis=0)
     img = sitk.GetImageFromArray(vol)
@@ -1032,6 +1075,8 @@ def _qc_roi_volume(path, n_slices, shape_yx, ref_img, body, inserts, patches, pa
     _write_json(Path(path).with_suffix(".json"), {
         "tag": tag, "roi_source": source, "patch_px": int(patch_px),
         "n_inserts": len(inserts), "n_patches": len(patches),
+        "region_source": region_src,
+        "region_px": int(np.asarray(region).sum()) if region is not None else 0,
         "labels": legend,
         "inserts": [{k: v for k, v in ins.items() if k != "area_px"} for ins in inserts],
     })
